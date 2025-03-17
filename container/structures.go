@@ -1,3 +1,7 @@
 package container
 
-// Container structures
+type ContainerConfig struct {
+  Image string
+  Cmd []string
+  Tty bool
+}

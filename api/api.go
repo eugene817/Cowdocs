@@ -29,13 +29,13 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
         return "", fmt.Errorf("failed to start container: %v", err)
     }
 
-    running, err := api.containerManager.IsRunning(id)
-    if err != nil {
-        return "", fmt.Errorf("failed to check container status: %w", err)
-    }
-    if !running {
-        return "", fmt.Errorf("container is not running")
-    }
+    // running, err := api.containerManager.IsRunning(id)
+    // if err != nil {
+    //     return "", fmt.Errorf("failed to check container status: %w", err)
+    // }
+    // if !running {
+    //     return "", fmt.Errorf("container is not running")
+    // }
   
     if _, err := api.containerManager.Wait(id); err != nil { 
         return "", fmt.Errorf("failed to wait for container: %v", err)

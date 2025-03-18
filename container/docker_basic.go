@@ -64,11 +64,14 @@ func (dm *DockerManager) Remove(containerID string) error {
 
 func (dm *DockerManager) Wait(containerID string) (container.WaitResponse, error) {
     ctx := context.Background()
-    resp, err := dm.cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
-    if err != nil {
-        return <-resp,fmt.Errorf("failed to wait for container: %v", err)
+    respC, errC := dm.cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+
+    select {
+    case resp := <-respC:
+        return resp, nil
+    case err := <-errC:
+        return container.WaitResponse{}, fmt.Errorf("failed to wait for container: %w", err)
     }
-    return <-resp, nil
 }
 
 

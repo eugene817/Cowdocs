@@ -62,14 +62,26 @@ func (dm *DockerManager) Remove(containerID string) error {
     return nil
 }
 
-func (dm *DockerManager) Wait(containerID string) error {
+func (dm *DockerManager) Wait(containerID string) (container.WaitResponse, error) {
     ctx := context.Background()
-    _, err := dm.cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+    resp, err := dm.cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
     if err != nil {
-        return fmt.Errorf("failed to wait for container: %v", err)
+        return <-resp,fmt.Errorf("failed to wait for container: %v", err)
     }
-    return nil
+    return <-resp, nil
 }
+
+
+func (dm *DockerManager) IsRunning(containerID string) (bool, error) {
+    ctx := context.Background()
+    inspect, err := dm.cli.ContainerInspect(ctx, containerID)
+    if err != nil {
+        return false, fmt.Errorf("failed to inspect container: %v", err)
+    }
+    return inspect.State.Running, nil
+}
+
+
 
 func (dm *DockerManager) GetLogs(containerID string) (string, error) {
     ctx := context.Background()

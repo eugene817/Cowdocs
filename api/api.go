@@ -1,8 +1,9 @@
 package api
 
 import (
-  "fmt"
-  "github.com/eugene817/Cowdocs/container"
+	"fmt"
+
+	"github.com/eugene817/Cowdocs/container"
 )
 
 type API struct {
@@ -27,10 +28,19 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
     if err := api.containerManager.Start(id); err != nil {
         return "", fmt.Errorf("failed to start container: %v", err)
     }
+
+    running, err := api.containerManager.IsRunning(id)
+    if err != nil {
+        return "", fmt.Errorf("failed to check container status: %w", err)
+    }
+    if !running {
+        return "", fmt.Errorf("container is not running")
+    }
   
-    if err := api.containerManager.Wait(id); err != nil {
+    if _, err := api.containerManager.Wait(id); err != nil { 
         return "", fmt.Errorf("failed to wait for container: %v", err)
     }
+    
         
     logs, err := api.containerManager.GetLogs(id)
     if err != nil {

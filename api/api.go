@@ -27,7 +27,11 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
     if err := api.containerManager.Start(id); err != nil {
         return "", fmt.Errorf("failed to start container: %v", err)
     }
-
+  
+    if err := api.containerManager.Wait(id); err != nil {
+        return "", fmt.Errorf("failed to wait for container: %v", err)
+    }
+        
     logs, err := api.containerManager.GetLogs(id)
     if err != nil {
         return "", fmt.Errorf("failed to get logs: %v", err)

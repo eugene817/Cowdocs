@@ -62,6 +62,15 @@ func (dm *DockerManager) Remove(containerID string) error {
     return nil
 }
 
+func (dm *DockerManager) Wait(containerID string) error {
+    ctx := context.Background()
+    _, err := dm.cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+    if err != nil {
+        return fmt.Errorf("failed to wait for container: %v", err)
+    }
+    return nil
+}
+
 func (dm *DockerManager) GetLogs(containerID string) (string, error) {
     ctx := context.Background()
     logsReader, err := dm.cli.ContainerLogs(ctx, containerID, container.LogsOptions{ShowStdout: true, ShowStderr: true})

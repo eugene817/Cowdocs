@@ -4,6 +4,7 @@ import (
   "github.com/docker/docker/api/types/container"
 )
 
+// Manager interface with methods to manage containers
 type Manager interface {
   Create(config ContainerConfig) (string, error)
   Start(id string) error
@@ -12,4 +13,5 @@ type Manager interface {
   GetLogs(id string) (string, error)
   Wait(id string) (container.WaitResponse, error)
   IsRunning(id string) (bool, error)
+  GetStats(containerID string) (container.StatsResponseReader, error)
 }

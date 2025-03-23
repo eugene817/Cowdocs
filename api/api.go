@@ -19,26 +19,34 @@ func NewAPI(mgr container.Manager) *API {
 
 // Function to run a container and return the logs
 // Creates. Starts, Waits and Removes the container.
-func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
+func (api *API) RunContainer(config container.ContainerConfig) (string, string, error) {
     id, err := api.containerManager.Create(config)
     if err != nil {
-        return "", fmt.Errorf("failed to create container: %v", err)
+        return "", "", fmt.Errorf("failed to create container: %v", err)
     }
     defer api.containerManager.Remove(id)
 
     if err := api.containerManager.Start(id); err != nil {
-        return "", fmt.Errorf("failed to start container: %v", err)
+        return "","",  fmt.Errorf("failed to start container: %v", err)
     }
+
+    stats, err := api.containerManager.GetStats(id) 
+    if err != nil {
+    return "", "", fmt.Errorf("failed to get stats: %v", err)
+    }
+
+    statsBuf := make([]byte, 100)
+    stats.Body.Read(statsBuf)
  
     if _, err := api.containerManager.Wait(id); err != nil { 
-        return "", fmt.Errorf("failed to wait for container: %v", err)
+        return "","",  fmt.Errorf("failed to wait for container: %v", err)
     }
     
     logs, err := api.containerManager.GetLogs(id)
     if err != nil {
-        return "", fmt.Errorf("failed to get logs: %v", err)
+        return "","",  fmt.Errorf("failed to get logs: %v", err)
     }
-    return logs, nil
+    return logs, string(statsBuf), nil
 }
 
 // Function to run containers in parallel using goroutines and channels.

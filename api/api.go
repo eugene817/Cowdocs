@@ -35,9 +35,6 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, string, 
     return "", "", fmt.Errorf("failed to get stats: %v", err)
     }
 
-    statsBuf := make([]byte, 10000)
-    stats.Body.Read(statsBuf)
- 
     if _, err := api.containerManager.Wait(id); err != nil { 
         return "","",  fmt.Errorf("failed to wait for container: %v", err)
     }
@@ -46,7 +43,7 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, string, 
     if err != nil {
         return "","",  fmt.Errorf("failed to get logs: %v", err)
     }
-    return logs, string(statsBuf), nil
+    return logs, stats, nil
 }
 
 // Function to run containers in parallel using goroutines and channels.

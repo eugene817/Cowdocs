@@ -13,5 +13,5 @@ type Manager interface {
   GetLogs(id string) (string, error)
   Wait(id string) (container.WaitResponse, error)
   IsRunning(id string) (bool, error)
-  GetStats(containerID string) (container.StatsResponseReader, error)
+  GetStats(containerID string) (string, error)
 }

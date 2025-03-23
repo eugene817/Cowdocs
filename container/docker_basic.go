@@ -3,7 +3,9 @@ package container
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
@@ -114,11 +116,28 @@ func (dm *DockerManager) GetLogs(containerID string) (string, error) {
     return strings.TrimSpace(stdout.String()), nil
 }
 
-func (dm *DockerManager) GetStats(containerID string) (dockerContainer.StatsResponseReader, error) {
+func (dm *DockerManager) GetStats(containerID string) (string, error) {
     ctx := context.Background()
     stats, err := dm.cli.ContainerStatsOneShot(ctx, containerID)
     if err != nil {
-        return dockerContainer.StatsResponseReader{}, fmt.Errorf("failed to get stats: %v", err)
+        return "", fmt.Errorf("failed to get stats: %v", err)
     }
-    return stats, nil
+
+    statsBytes, err := io.ReadAll(stats.Body)
+    if err != nil {
+      return "", fmt.Errorf("failed to read stats: %v", err)
+    }
+    defer stats.Body.Close()
+
+    var statsData container.StatsResponse
+    if err := json.Unmarshal(statsBytes, &statsData); err != nil {
+      return "", fmt.Errorf("failed to parse stats: %v", err)
+    }
+
+    statsFormatted, err := json.MarshalIndent(statsData, "", " ") 
+    if err != nil {
+      return "", fmt.Errorf("failed to format stats: %v", err)
+    }
+  
+    return string(statsFormatted), nil
 }

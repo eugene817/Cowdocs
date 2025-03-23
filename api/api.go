@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"sync"
 
 	"github.com/eugene817/Cowdocs/container"
 )
@@ -41,7 +42,8 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
 }
 
 
-func (api *API) RunContainerChannel(config container.ContainerConfig, c chan string) error {
+func (api *API) RunContainerParallel(config container.ContainerConfig, wg *sync.WaitGroup, c chan string) error {
+    defer wg.Done()
     id, err := api.containerManager.Create(config)
     if err != nil {
         return fmt.Errorf("failed to create container: %v", err)

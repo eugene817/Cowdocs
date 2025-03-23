@@ -7,18 +7,18 @@ import (
 	"github.com/eugene817/Cowdocs/container"
 )
 
+// API struct with containerManager field
 type API struct {
-  containerManager container.DockerManager
+  containerManager container.Manager
 }
 
-func NewAPI() (*API, error) {
-  mgr, err := container.NewDockerManager()
-  if err != nil {
-    return nil, err
-  }
-  return &API{containerManager: *mgr}, nil
+// Function to create a new API instance
+func NewAPI(mgr container.Manager) *API {
+  return &API{containerManager: mgr}
 }
 
+// Function to run a container and return the logs
+// Creates. Starts, Waits and Removes the container.
 func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
     id, err := api.containerManager.Create(config)
     if err != nil {
@@ -41,7 +41,9 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, error) {
     return logs, nil
 }
 
-
+// Function to run containers in parallel using goroutines and channels.
+// The container logs are sent to the channel.
+// Creates. Starts, Waits and Removes the container.
 func (api *API) RunContainerParallel(config container.ContainerConfig, wg *sync.WaitGroup, c chan string) error {
     defer wg.Done()
     id, err := api.containerManager.Create(config)

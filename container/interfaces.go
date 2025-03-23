@@ -7,7 +7,7 @@ import (
 type Manager interface {
   Create(config ContainerConfig) (string, error)
   Start(id string) error
-  Stop(id string) error
+  Stop(id string, timeout int) error
   Remove(id string) error
   GetLogs(id string) (string, error)
   Wait(id string) (container.WaitResponse, error)

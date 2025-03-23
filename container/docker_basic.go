@@ -116,6 +116,7 @@ func (dm *DockerManager) GetLogs(containerID string) (string, error) {
     return strings.TrimSpace(stdout.String()), nil
 }
 
+// Function to get stats from docker container and format them
 func (dm *DockerManager) GetStats(containerID string) (string, error) {
     ctx := context.Background()
     stats, err := dm.cli.ContainerStatsOneShot(ctx, containerID)

@@ -31,6 +31,10 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
         return "","",  fmt.Errorf("failed to start container: %v", err)
     }
 
+    statsReturn, err := api.containerManager.GetStats(id) 
+        if err != nil {
+          return "", "", fmt.Errorf("failed to get stats: %v", err)
+        }
     
     if _, err := api.containerManager.Wait(id); err != nil { 
         return "","",  fmt.Errorf("failed to wait for container: %v", err)
@@ -42,11 +46,7 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
     }
   
     if showStats {
-      stats, err := api.containerManager.GetStats(id) 
-        if err != nil {
-          return "", "", fmt.Errorf("failed to get stats: %v", err)
-        }
-      return logs, stats, nil
+      return logs, statsReturn, nil
     }
     return logs, "", nil
 }

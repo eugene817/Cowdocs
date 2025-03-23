@@ -35,7 +35,7 @@ func (api *API) RunContainer(config container.ContainerConfig) (string, string, 
     return "", "", fmt.Errorf("failed to get stats: %v", err)
     }
 
-    statsBuf := make([]byte, 100)
+    statsBuf := make([]byte, 10000)
     stats.Body.Read(statsBuf)
  
     if _, err := api.containerManager.Wait(id); err != nil { 

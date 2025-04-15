@@ -3,7 +3,7 @@ module github.com/eugene817/Cowdocs
 go 1.23.3
 
 require (
-	github.com/docker/docker v28.0.1+incompatible
+	github.com/docker/docker v28.0.4+incompatible
 	github.com/stretchr/testify v1.10.0
 )
 

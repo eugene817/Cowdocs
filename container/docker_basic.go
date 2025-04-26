@@ -1,6 +1,7 @@
 package container
 
 import (
+  "os"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/api/types/container"
+  "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -30,23 +32,23 @@ func NewDockerManager() (*DockerManager, error) {
 
 // ensureImage checks if there is an image of the container
 // if not it pulls it.
-func (dm *DockerManager) EnsureImage(image string) error {
+func (dm *DockerManager) EnsureImage(imageName string) error {
     ctx := context.Background()
 
     // Inspect the image to check if it exists
-    if _, _, err := dm.cli.ImageInspectWithRaw(ctx, image); err == nil {
+    if _, _, err := dm.cli.ImageInspectWithRaw(ctx, imageName); err == nil {
         return nil // Image exists, no need to pull
     }
 
     // pull
-    reader, err := dm.cli.ImagePull(ctx, image, types.ImagePullOptions{})
+    reader, err := dm.cli.ImagePull(ctx, imageName, image.PullOptions{}) 
     if err != nil {
-        return fmt.Errorf("failed to pull image %s: %w", image, err)
+        return fmt.Errorf("failed to pull image %s: %w", imageName, err)
     }
     defer reader.Close()
     // close the stream
     if _, err := io.Copy(os.Stdout, reader); err != nil {
-        return fmt.Errorf("failed to read pull response for %s: %w", image, err)
+        return fmt.Errorf("failed to read pull response for %s: %w", imageName, err)
     }
     return nil
 }

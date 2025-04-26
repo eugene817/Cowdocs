@@ -89,5 +89,5 @@ func (api *API) EnsureImages(images []string) error {
 }
 
 func (api *API) Ping() error {
-  return api.Ping()
+  return api.containerManager.Ping()
 }

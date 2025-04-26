@@ -77,3 +77,13 @@ func (api *API) RunContainerParallel(config container.ContainerConfig, wg *sync.
     c <- logs
     return nil
 }
+
+
+func (api *API) EnsureImages(images []string) error {
+    for _, image := range images {
+        if err := api.containerManager.EnsureImage(image); err != nil {
+            return fmt.Errorf("failed to ensure image %s: %v", image, err)
+        }
+    }
+    return nil
+}

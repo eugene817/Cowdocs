@@ -30,7 +30,7 @@ func NewDockerManager() (*DockerManager, error) {
 
 // ensureImage checks if there is an image of the container
 // if not it pulls it.
-func (dm *DockerManager) ensureImage(image string) error {
+func (dm *DockerManager) EnsureImage(image string) error {
     ctx := context.Background()
 
     // Inspect the image to check if it exists
@@ -55,7 +55,7 @@ func (dm *DockerManager) ensureImage(image string) error {
 func (dm *DockerManager) Create(config ContainerConfig) (string, error) {
 
   // Ensure the image is available
-  if err := dm.ensureImage(config.Image); err != nil {
+  if err := dm.EnsureImage(config.Image); err != nil {
     return "", err
   }
 

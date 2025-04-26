@@ -15,4 +15,5 @@ type Manager interface {
   IsRunning(id string) (bool, error)
   GetStats(containerID string) (string, error)
   EnsureImage(image string) error
+  Ping() error
 }

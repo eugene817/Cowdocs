@@ -171,3 +171,9 @@ func (dm *DockerManager) GetStats(containerID string) (string, error) {
 
 	return string(statsFormatted), nil
 }
+
+func (dm *DockerManager) Ping() error {
+  ctx := context.Background()
+  _, err := dm.cli.Ping(ctx)
+  return err
+}

@@ -87,3 +87,7 @@ func (api *API) EnsureImages(images []string) error {
     }
     return nil
 }
+
+func (api *API) Ping() error {
+  return api.Ping()
+}

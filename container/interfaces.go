@@ -14,4 +14,5 @@ type Manager interface {
   Wait(id string) (container.WaitResponse, error)
   IsRunning(id string) (bool, error)
   GetStats(containerID string) (string, error)
+  ensureImage(image string) error
 }

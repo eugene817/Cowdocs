@@ -259,7 +259,7 @@ func (dm *DockerManager) GetStatsStreamed(
 	}
 }
 
-// StatsRecord holds exactly the fields we need for one container run.
+// StatsRecord must match (or be convertible from) container.ContainerStatsSummary
 type StatsRecord struct {
 	ID            string        `json:"id"`
 	StartTime     time.Time     `json:"start_time"`
@@ -270,70 +270,56 @@ type StatsRecord struct {
 	MemMaxBytes   uint64        `json:"mem_max_bytes"`
 }
 
-// Monitor listens for Docker "start" and "die" events. As soon as "die" fires,
-// it reads the cgroup files (cpuacct.usage, memory.usage_in_bytes, memory.max_usage_in_bytes)
-// and prints out a JSON record.
-func Monitor(ctx context.Context) error {
+// Monitor is a helper you add into your application (not in the library).
+// As soon as a container dies, it calls onRecord(...) with a StatsRecord.
+func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
+	// Create a Docker client (same as in Cowdocs)
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("could not create Docker client: %w", err)
 	}
 	defer cli.Close()
 
-	// We keep a map from containerID -> time it started.
+	// Keep a map from containerID → time it started
 	startTimes := make(map[string]time.Time)
 
-	// Build filters.Args (not types.Filters).
-	// We only want "start" and "die" events for containers.
+	// Build filters.Args to get only container start/die events
 	filterArgs := filters.NewArgs()
 	filterArgs.Add("type", "container")
 	filterArgs.Add("event", "start")
 	filterArgs.Add("event", "die")
 
-	//
-	// IMPORTANT: In your vendored SDK, there is no types.EventsOptions.
-	// Instead, you pass filterArgs directly to cli.Events.
-	//
-	// In other words, do NOT write:
-	//     cli.Events(ctx, types.EventsOptions{Filters: filterArgs})
-	// That type (EventsOptions) does not exist here.
-	//
-	// Instead, write:
-	//
+	// Pass filterArgs into events.ListOptions
 	messages, errs := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
-
 	for {
 		select {
 		case err := <-errs:
 			return fmt.Errorf("error from Docker events: %w", err)
 
 		case msg := <-messages:
-			// `msg.Action` is a string ("start" or "die").
-			// `msg.Time` is an int64 (Unix seconds).
+			// msg.Action is "start" or "die"
+			// msg.Time is int64 (Unix seconds)
 			switch msg.Action {
 			case "start":
-				// Convert msg.Time (int64) → time.Time
 				startTimes[msg.ID] = time.Unix(msg.Time, 0)
 
 			case "die":
-				// The container has exited; see if we saw its start.
 				st, ok := startTimes[msg.ID]
 				if !ok {
-					// If we never saw "start", skip it.
+					// If we never saw "start", skip it
 					continue
 				}
 				endTime := time.Unix(msg.Time, 0)
 
-				record, err := CaptureMetrics(msg.ID, st, endTime)
+				// Read cgroup files as soon as the container dies
+				rec, err := captureMetrics(msg.ID, st, endTime)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "error capturing metrics for %s: %v\n", msg.ID, err)
+					// Just log and move on
+					fmt.Fprintf(os.Stderr, "captureMetrics(%s) error: %v\n", msg.ID, err)
 					delete(startTimes, msg.ID)
 					continue
 				}
-
-				out, _ := json.MarshalIndent(record, "", "  ")
-				fmt.Println(string(out))
-
+				onRecord(*rec)
 				delete(startTimes, msg.ID)
 			}
 		case <-ctx.Done():
@@ -342,16 +328,15 @@ func Monitor(ctx context.Context) error {
 	}
 }
 
-// CaptureMetrics reads from /sys/fs/cgroup (v1) for CPU and memory usage.
-// Adjust the paths if you are on cgroup v2 or a non‐Docker cgroup hierarchy.
-func CaptureMetrics(containerID string, start, end time.Time) (*StatsRecord, error) {
+// captureMetrics reads exactly the same cgroup‐based CPU/memory from DockerManager.GetStatsStreamed
+// but in this function we read them directly from /sys/fs/cgroup because we know DockerManager.GetStatsStreamed
+// already implements streaming. If you want to re-use DockerManager.GetStatsStreamed, you can do so here.
+func captureMetrics(containerID string, start, end time.Time) (*StatsRecord, error) {
 	base := "/sys/fs/cgroup"
-
 	cpuPath := filepath.Join(base, "cpu,cpuacct/docker", containerID, "cpuacct.usage")
 	memUsagePath := filepath.Join(base, "memory/docker", containerID, "memory.usage_in_bytes")
 	memMaxPath := filepath.Join(base, "memory/docker", containerID, "memory.max_usage_in_bytes")
 
-	// 1. Read CPU usage (ns)
 	cpuBytes, err := ioutil.ReadFile(cpuPath)
 	if err != nil {
 		return nil, fmt.Errorf("read cpu usage: %w", err)
@@ -359,7 +344,6 @@ func CaptureMetrics(containerID string, start, end time.Time) (*StatsRecord, err
 	var cpuUsageNs uint64
 	fmt.Sscanf(string(cpuBytes), "%d", &cpuUsageNs)
 
-	// 2. Read current memory usage
 	memBytes, err := ioutil.ReadFile(memUsagePath)
 	if err != nil {
 		return nil, fmt.Errorf("read mem usage: %w", err)
@@ -367,7 +351,6 @@ func CaptureMetrics(containerID string, start, end time.Time) (*StatsRecord, err
 	var memUsage uint64
 	fmt.Sscanf(string(memBytes), "%d", &memUsage)
 
-	// 3. Read peak memory usage
 	memMaxBytes, err := ioutil.ReadFile(memMaxPath)
 	if err != nil {
 		return nil, fmt.Errorf("read mem max usage: %w", err)

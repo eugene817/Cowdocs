@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
@@ -187,10 +186,6 @@ func (dm *DockerManager) Ping() error {
 	return err
 }
 
-// GetStatsStreamed opens a stats stream for the given container ID and
-// continuously reads JSON frames until the container exits. It calculates
-// the peak memory usage and captures the last CPU % and memory usage. Once
-// the stream closes (EOF), it sends a ContainerStatsSummary on resultCh.
 func (dm *DockerManager) GetStatsStreamed(
 	containerID string,
 	startTime time.Time,
@@ -199,7 +194,7 @@ func (dm *DockerManager) GetStatsStreamed(
 ) {
 	ctx := context.Background()
 
-	// Open a streaming stats connection (stream=true).
+	// 1. Open streaming stats (stream=true)
 	resp, err := dm.cli.ContainerStats(ctx, containerID, true)
 	if err != nil {
 		errCh <- fmt.Errorf("failed to open stats stream: %v", err)
@@ -209,36 +204,33 @@ func (dm *DockerManager) GetStatsStreamed(
 
 	decoder := json.NewDecoder(resp.Body)
 
+	// 2. Decode frames into container.StatsResponse (not types.StatsJSON)
 	var (
-		frame   types.StatsJSON
+		frame   container.StatsResponse
 		peakMem uint64 = 0
 		lastMem uint64 = 0
 		lastCPU float64
 	)
 
-	// Read each JSON frame until EOF (container exit).
+	// 3. Loop until EOF (container exit)
 	for {
 		if err := decoder.Decode(&frame); err != nil {
 			if err == io.EOF {
-				// The stats stream closed because the container exited.
+				// streaming closed because container exited
 				break
 			}
-			// Any other error should be reported.
 			errCh <- fmt.Errorf("error decoding stats frame: %v", err)
 			return
 		}
 
-		// Update peak memory usage if this frame's Usage is higher.
+		// 4. Update peak memory and last memory
 		used := frame.MemoryStats.Usage
 		if used > peakMem {
 			peakMem = used
 		}
 		lastMem = used
 
-		// Compute CPU percentage using Docker’s formula:
-		// cpuDelta = totalUsage - preTotalUsage
-		// systemDelta = systemUsage - preSystemUsage
-		// cpuPercent = (cpuDelta / systemDelta) * numberOfCores * 100
+		// 5. Compute CPU% using Docker’s formula:
 		cpuDelta := float64(frame.CPUStats.CPUUsage.TotalUsage) -
 			float64(frame.PreCPUStats.CPUUsage.TotalUsage)
 		systemDelta := float64(frame.CPUStats.SystemUsage) -
@@ -249,14 +241,12 @@ func (dm *DockerManager) GetStatsStreamed(
 				float64(len(frame.CPUStats.CPUUsage.PercpuUsage)) * 100.0
 		}
 		lastCPU = cpuPercent
-
-		// Continue looping to process the next frame (approximately every second).
 	}
 
-	// Calculate total runtime duration.
+	// 6. Once EOF is reached, the container has exited; compute duration
 	duration := time.Since(startTime)
 
-	// Send the summary to the channel.
+	// 7. Send summary on resultCh
 	resultCh <- ContainerStatsSummary{
 		Duration:       duration,
 		LastMemUsage:   lastMem,

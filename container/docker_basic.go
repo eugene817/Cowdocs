@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -253,4 +257,131 @@ func (dm *DockerManager) GetStatsStreamed(
 		PeakMemUsage:   peakMem,
 		LastCPUPercent: lastCPU,
 	}
+}
+
+// StatsRecord holds exactly the fields we need for one container run.
+type StatsRecord struct {
+	ID            string        `json:"id"`
+	StartTime     time.Time     `json:"start_time"`
+	EndTime       time.Time     `json:"end_time"`
+	Duration      time.Duration `json:"duration"`
+	CPUUsageNs    uint64        `json:"cpu_usage_ns"`
+	MemUsageBytes uint64        `json:"mem_usage_bytes"`
+	MemMaxBytes   uint64        `json:"mem_max_bytes"`
+}
+
+// Monitor listens for Docker "start" and "die" events. As soon as "die" fires,
+// it reads the cgroup files (cpuacct.usage, memory.usage_in_bytes, memory.max_usage_in_bytes)
+// and prints out a JSON record.
+func Monitor(ctx context.Context) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return fmt.Errorf("could not create Docker client: %w", err)
+	}
+	defer cli.Close()
+
+	// We keep a map from containerID -> time it started.
+	startTimes := make(map[string]time.Time)
+
+	// Build filters.Args (not types.Filters).
+	// We only want "start" and "die" events for containers.
+	filterArgs := filters.NewArgs()
+	filterArgs.Add("type", "container")
+	filterArgs.Add("event", "start")
+	filterArgs.Add("event", "die")
+
+	//
+	// IMPORTANT: In your vendored SDK, there is no types.EventsOptions.
+	// Instead, you pass filterArgs directly to cli.Events.
+	//
+	// In other words, do NOT write:
+	//     cli.Events(ctx, types.EventsOptions{Filters: filterArgs})
+	// That type (EventsOptions) does not exist here.
+	//
+	// Instead, write:
+	//
+	messages, errs := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
+
+	for {
+		select {
+		case err := <-errs:
+			return fmt.Errorf("error from Docker events: %w", err)
+
+		case msg := <-messages:
+			// `msg.Action` is a string ("start" or "die").
+			// `msg.Time` is an int64 (Unix seconds).
+			switch msg.Action {
+			case "start":
+				// Convert msg.Time (int64) → time.Time
+				startTimes[msg.ID] = time.Unix(msg.Time, 0)
+
+			case "die":
+				// The container has exited; see if we saw its start.
+				st, ok := startTimes[msg.ID]
+				if !ok {
+					// If we never saw "start", skip it.
+					continue
+				}
+				endTime := time.Unix(msg.Time, 0)
+
+				record, err := CaptureMetrics(msg.ID, st, endTime)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "error capturing metrics for %s: %v\n", msg.ID, err)
+					delete(startTimes, msg.ID)
+					continue
+				}
+
+				out, _ := json.MarshalIndent(record, "", "  ")
+				fmt.Println(string(out))
+
+				delete(startTimes, msg.ID)
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// CaptureMetrics reads from /sys/fs/cgroup (v1) for CPU and memory usage.
+// Adjust the paths if you are on cgroup v2 or a non‐Docker cgroup hierarchy.
+func CaptureMetrics(containerID string, start, end time.Time) (*StatsRecord, error) {
+	base := "/sys/fs/cgroup"
+
+	cpuPath := filepath.Join(base, "cpu,cpuacct/docker", containerID, "cpuacct.usage")
+	memUsagePath := filepath.Join(base, "memory/docker", containerID, "memory.usage_in_bytes")
+	memMaxPath := filepath.Join(base, "memory/docker", containerID, "memory.max_usage_in_bytes")
+
+	// 1. Read CPU usage (ns)
+	cpuBytes, err := ioutil.ReadFile(cpuPath)
+	if err != nil {
+		return nil, fmt.Errorf("read cpu usage: %w", err)
+	}
+	var cpuUsageNs uint64
+	fmt.Sscanf(string(cpuBytes), "%d", &cpuUsageNs)
+
+	// 2. Read current memory usage
+	memBytes, err := ioutil.ReadFile(memUsagePath)
+	if err != nil {
+		return nil, fmt.Errorf("read mem usage: %w", err)
+	}
+	var memUsage uint64
+	fmt.Sscanf(string(memBytes), "%d", &memUsage)
+
+	// 3. Read peak memory usage
+	memMaxBytes, err := ioutil.ReadFile(memMaxPath)
+	if err != nil {
+		return nil, fmt.Errorf("read mem max usage: %w", err)
+	}
+	var memMax uint64
+	fmt.Sscanf(string(memMaxBytes), "%d", &memMax)
+
+	return &StatsRecord{
+		ID:            containerID,
+		StartTime:     start,
+		EndTime:       end,
+		Duration:      end.Sub(start),
+		CPUUsageNs:    cpuUsageNs,
+		MemUsageBytes: memUsage,
+		MemMaxBytes:   memMax,
+	}, nil
 }

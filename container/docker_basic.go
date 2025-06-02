@@ -1,16 +1,18 @@
 package container
 
 import (
-  "os"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"strings"
+	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
-  "github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 )
@@ -18,6 +20,14 @@ import (
 // DockerManager struct with cli field
 type DockerManager struct {
 	cli *client.Client
+}
+
+// ContainerStatsSummary holds the aggregated stats we want at container exit.
+type ContainerStatsSummary struct {
+	Duration       time.Duration // Total time the container ran
+	LastMemUsage   uint64        // Memory usage in the last stats frame (bytes)
+	PeakMemUsage   uint64        // Peak memory usage over the container’s lifetime (bytes)
+	LastCPUPercent float64       // CPU percentage in the last stats frame
 }
 
 // Docker manager constructor
@@ -29,37 +39,36 @@ func NewDockerManager() (*DockerManager, error) {
 	return &DockerManager{cli: cli}, nil
 }
 
-
 // ensureImage checks if there is an image of the container
 // if not it pulls it.
 func (dm *DockerManager) EnsureImage(imageName string) error {
-    ctx := context.Background()
+	ctx := context.Background()
 
-    // Inspect the image to check if it exists
-    if _, _, err := dm.cli.ImageInspectWithRaw(ctx, imageName); err == nil {
-        return nil // Image exists, no need to pull
-    }
+	// Inspect the image to check if it exists
+	if _, _, err := dm.cli.ImageInspectWithRaw(ctx, imageName); err == nil {
+		return nil // Image exists, no need to pull
+	}
 
-    // pull
-    reader, err := dm.cli.ImagePull(ctx, imageName, image.PullOptions{}) 
-    if err != nil {
-        return fmt.Errorf("failed to pull image %s: %w", imageName, err)
-    }
-    defer reader.Close()
-    // close the stream
-    if _, err := io.Copy(os.Stdout, reader); err != nil {
-        return fmt.Errorf("failed to read pull response for %s: %w", imageName, err)
-    }
-    return nil
+	// pull
+	reader, err := dm.cli.ImagePull(ctx, imageName, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull image %s: %w", imageName, err)
+	}
+	defer reader.Close()
+	// close the stream
+	if _, err := io.Copy(os.Stdout, reader); err != nil {
+		return fmt.Errorf("failed to read pull response for %s: %w", imageName, err)
+	}
+	return nil
 }
 
 // Function to create a container
 func (dm *DockerManager) Create(config ContainerConfig) (string, error) {
 
-  // Ensure the image is available
-  if err := dm.EnsureImage(config.Image); err != nil {
-    return "", err
-  }
+	// Ensure the image is available
+	if err := dm.EnsureImage(config.Image); err != nil {
+		return "", err
+	}
 
 	ctx := context.Background()
 	containerConfig := &container.Config{
@@ -173,7 +182,85 @@ func (dm *DockerManager) GetStats(containerID string) (string, error) {
 }
 
 func (dm *DockerManager) Ping() error {
-  ctx := context.Background()
-  _, err := dm.cli.Ping(ctx)
-  return err
+	ctx := context.Background()
+	_, err := dm.cli.Ping(ctx)
+	return err
+}
+
+// GetStatsStreamed opens a stats stream for the given container ID and
+// continuously reads JSON frames until the container exits. It calculates
+// the peak memory usage and captures the last CPU % and memory usage. Once
+// the stream closes (EOF), it sends a ContainerStatsSummary on resultCh.
+func (dm *DockerManager) GetStatsStreamed(
+	containerID string,
+	startTime time.Time,
+	resultCh chan<- ContainerStatsSummary,
+	errCh chan<- error,
+) {
+	ctx := context.Background()
+
+	// Open a streaming stats connection (stream=true).
+	resp, err := dm.cli.ContainerStats(ctx, containerID, true)
+	if err != nil {
+		errCh <- fmt.Errorf("failed to open stats stream: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	decoder := json.NewDecoder(resp.Body)
+
+	var (
+		frame   types.StatsJSON
+		peakMem uint64 = 0
+		lastMem uint64 = 0
+		lastCPU float64
+	)
+
+	// Read each JSON frame until EOF (container exit).
+	for {
+		if err := decoder.Decode(&frame); err != nil {
+			if err == io.EOF {
+				// The stats stream closed because the container exited.
+				break
+			}
+			// Any other error should be reported.
+			errCh <- fmt.Errorf("error decoding stats frame: %v", err)
+			return
+		}
+
+		// Update peak memory usage if this frame's Usage is higher.
+		used := frame.MemoryStats.Usage
+		if used > peakMem {
+			peakMem = used
+		}
+		lastMem = used
+
+		// Compute CPU percentage using Docker’s formula:
+		// cpuDelta = totalUsage - preTotalUsage
+		// systemDelta = systemUsage - preSystemUsage
+		// cpuPercent = (cpuDelta / systemDelta) * numberOfCores * 100
+		cpuDelta := float64(frame.CPUStats.CPUUsage.TotalUsage) -
+			float64(frame.PreCPUStats.CPUUsage.TotalUsage)
+		systemDelta := float64(frame.CPUStats.SystemUsage) -
+			float64(frame.PreCPUStats.SystemUsage)
+		cpuPercent := 0.0
+		if systemDelta > 0 && cpuDelta > 0 {
+			cpuPercent = (cpuDelta / systemDelta) *
+				float64(len(frame.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+		}
+		lastCPU = cpuPercent
+
+		// Continue looping to process the next frame (approximately every second).
+	}
+
+	// Calculate total runtime duration.
+	duration := time.Since(startTime)
+
+	// Send the summary to the channel.
+	resultCh <- ContainerStatsSummary{
+		Duration:       duration,
+		LastMemUsage:   lastMem,
+		PeakMemUsage:   peakMem,
+		LastCPUPercent: lastCPU,
+	}
 }

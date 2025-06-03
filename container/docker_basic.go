@@ -202,29 +202,22 @@ func (dm *DockerManager) Ping() error {
 	return err
 }
 
-// Monitor listens for Docker "start" and "die" events. As soon as a container dies,
-// it uses the pre‐cached cgroupInfo (collected on "start") to read exactly the right files
-// under /sys/fs/cgroup and invokes onRecord(rec).
+// Monitor: на "start" сохраняем PID и relPaths, на "die" читаем stats и сразу выводим логи.
 func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
-	// 1) New Docker client
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("could not create Docker client: %w", err)
 	}
 	defer cli.Close()
 
-	// 2) Map containerID → cgroupInfo (pid + relPaths)
 	infos := make(map[string]cgroupInfo)
 
-	// 3) Build filters to only get "container start" and "container die"
 	filterArgs := filters.NewArgs()
 	filterArgs.Add("type", "container")
 	filterArgs.Add("event", "start")
 	filterArgs.Add("event", "die")
 
-	// 4) Subscribe to events
 	messages, errs := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
-
 	for {
 		select {
 		case err := <-errs:
@@ -233,48 +226,38 @@ func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
 		case msg := <-messages:
 			switch msg.Action {
 			case "start":
-				// As soon as the container enters "running", capture its PID + cgroup paths
-				st := time.Unix(msg.Time, 0)
-				pid, relPaths, err := fetchCgroupInfo(ctx, cli, msg.ID)
-				if err != nil {
-					log.Printf("fetchCgroupInfo(%s) error: %v\n", msg.ID, err)
-					// If we fail to fetch cgroup info, we skip storing it.
-					// We will not be able to collect metrics on die, but at least the app continues.
+				// Сразу после старта сохраняем PID и relPaths
+				pid, relPaths, fetchErr := fetchCgroupInfo(ctx, cli, msg.ID)
+				if fetchErr != nil {
+					log.Printf("fetchCgroupInfo(%s) error: %v\n", msg.ID, fetchErr)
 					continue
 				}
+				relPaths["__start_time"] = time.Unix(msg.Time, 0).Format(time.RFC3339Nano)
 				infos[msg.ID] = cgroupInfo{pid: pid, relPaths: relPaths}
-				// Note: we also need to record start time so we can compute duration on "die"
-				// We'll overwrite infos[msg.ID] below, so let's keep start time in relPaths under a sentinel key:
-				relPaths["__start_time"] = st.Format(time.RFC3339Nano)
 
 			case "die":
-				// When container dies, look up its stored cgroupInfo
 				info, ok := infos[msg.ID]
 				if !ok {
-					// We never saw a "start" or failed to fetch info. Skip.
 					continue
 				}
-				// Parse the recorded start time:
+				// Парсим время старта
 				stStr := info.relPaths["__start_time"]
-				startTime, err := time.Parse(time.RFC3339Nano, stStr)
-				if err != nil {
-					// If the stored start time parsing fails, default to msg.Time
-					startTime = time.Unix(msg.Time, 0)
-				}
+				startTime, _ := time.Parse(time.RFC3339Nano, stStr)
 				endTime := time.Unix(msg.Time, 0)
 
-				// Now gather CPU + Memory using the cached cgroupInfo
+				// Снимаем метрики
 				rec, err := readStatsFromCgroup(info, msg.ID, startTime, endTime)
 				if err != nil {
-					log.Printf("error reading stats for %s: %v\n", msg.ID, err)
+					log.Printf("readStatsFromCgroup(%s) error: %v\n", msg.ID, err)
 					delete(infos, msg.ID)
 					continue
 				}
 
-				// Invoke the callback
-				onRecord(*rec)
+				// Печатаем логи контейнера
+				printContainerLogs(ctx, cli, msg.ID)
 
-				// Cleanup
+				// Вызываем callback для stats
+				onRecord(*rec)
 				delete(infos, msg.ID)
 			}
 		case <-ctx.Done():
@@ -420,4 +403,36 @@ func readStatsFromCgroup(info cgroupInfo, containerID string, start, end time.Ti
 		MemUsageBytes: memUsageBytes,
 		MemMaxBytes:   memMaxBytes,
 	}, nil
+}
+
+// printContainerLogs просто читает stdout+stderr и выводит в консоль.
+func printContainerLogs(ctx context.Context, cli *client.Client, containerID string) {
+	reader, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Timestamps: false,
+		Follow:     false, // сразу получить всё и закрыть
+	})
+	if err != nil {
+		log.Printf("ContainerLogs(%s) error: %v\n", containerID, err)
+		return
+	}
+	defer reader.Close()
+
+	// Docker multiplexes stdout+stderr; используем stdcopy для разделения потоков
+	var stdoutBuf, stderrBuf bytes.Buffer
+	if _, err := stdcopy.StdCopy(&stdoutBuf, &stderrBuf, reader); err != nil {
+		log.Printf("StdCopy error for %s: %v\n", containerID, err)
+		return
+	}
+
+	// Печатаем сначала stdout, потом stderr (при желании можно объеденить)
+	outStr := strings.TrimRight(stdoutBuf.String(), "\n")
+	errStr := strings.TrimRight(stderrBuf.String(), "\n")
+	if outStr != "" {
+		log.Printf("Logs of %s (stdout):\n%s\n", containerID, outStr)
+	}
+	if errStr != "" {
+		log.Printf("Logs of %s (stderr):\n%s\n", containerID, errStr)
+	}
 }

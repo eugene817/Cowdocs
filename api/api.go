@@ -19,78 +19,79 @@ func NewAPI(mgr container.Manager) *API {
 	return &API{containerManager: mgr}
 }
 
-// RunContainer запускает контейнер, агрессивно «поллит» его stats в tight‐loop,
-// пока контейнер не завершится, и возвращает stdout+stderr и JSON со статистикой.
-// Даже если контейнер прожил 5 мс, первый же вызов GetStatsOneShot после Start
-// гарантированно успеет вернуть хоть один снимок, прежде чем контейнер полностью уйдёт.
+// RunContainer запускает контейнер и «на лету» собирает stats,
+// чтобы ни один короткоживущий контейнер не ушёл с нулевыми метриками.
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// 1) Создаём контейнер
+	// Шаг 1: Создаём контейнер
 	id, err := api.containerManager.Create(config)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
-	// Удалим контейнер в defer после того, как соберём логи и stats
+	// Обязательно удаляем контейнер в defer, когда всё сделаем
 	defer api.containerManager.Remove(id)
 
-	// 2) Стартуем контейнер и фиксируем момент старта
+	// Шаг 2: Стартуем контейнер и фиксируем время старта
 	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// 3) Если нужна статистика, запускаем поллинг в tight‐loop (без длительных sleep),
-	//    чтобы поймать хоть один снимок, пока контейнер жив
+	// Переменная для хранения последнего «валидного» snapshot-а
+	var lastSummary container.ContainerStatsSummary
+	var gotSummary bool
 	var statsJSON string
-	if showStats {
-		// Приоритет: первый же вызов GetStatsOneShot лови даже если контейнер закончится через 1 мс
-		var lastSummary container.ContainerStatsSummary
-		var gotSummary bool
 
-		// Канал, чтобы знать, когда контейнер закончил работу
+	if showStats {
+		// Канал, сигнализирующий, что контейнер завершил работу
 		doneCh := make(chan struct{})
 
-		// 3a) Горутина: ждём завершения контейнера
+		// Шаг 3a: Горутина, которая ждёт завершения контейнера
 		go func() {
-			api.containerManager.Wait(id) // ждёт, пока контейнер уйдёт
+			api.containerManager.Wait(id)
 			close(doneCh)
 		}()
 
-		// 3b) В tight‐loop вызываем GetStatsOneShot(id) до тех пор, пока не увидим doneCh
+		// Шаг 3b: Tight-loop поллинга, чтобы поймать stats пока контейнер alive
 		for {
-			// Выполняем один «одноразовый» снимок
+			// Пытаемся снять одноразовый snapshot stats
 			summary, err := api.containerManager.GetStatsOneShot(id, startTime)
 			if err == nil {
+				// Если нам вернулся хоть какой-то summary, сохраняем его
+				// (могут быть нулевые поля, но мы запомним последний snapshot)
 				lastSummary = summary
 				gotSummary = true
+				// Если CPU или память уже ненулевые — останавливаемся раньше
+				if summary.CPUPercent != 0 || summary.MemUsage != 0 {
+					break
+				}
 			}
-			// Проверяем, не завершился ли контейнер
+			// Проверяем, завершился ли контейнер
 			select {
 			case <-doneCh:
-				// Контейнер вышел – выходим из цикла
+				// Контейнер уже завершился — выходим из цикла
 				goto AFTER_POLL
 			default:
-				// Контейнер всё ещё жив – сразу пробуем снова (без длительного sleep)
-				// можно вставить tiny sleep, например time.Sleep(1 * time.Millisecond),
-				// но в большинстве случаев даже без sleep мы успеваем поймать snapshot
-				// быстрее, чем контейнер полностью пропадёт.
+				// Контейнер всё ещё жив — повторяем без задержки
 			}
 		}
+
 	AFTER_POLL:
-		// 3c) По завершении контейнера используем последний валидный snapshot
+		// Шаг 3c: Когда контейнер вышел или мы успели получить ненулевой snapshot
 		if gotSummary {
 			data, _ := json.MarshalIndent(lastSummary, "", "  ")
+			// У нас в lastSummary.Duration уже лежит корректный duration
+			// (time.Since(startTime) мы сделали внутри GetStatsOneShot).
 			statsJSON = string(data)
 		} else {
-			// Если даже ни разу не удалось сделать snapshot (чрезвычайно маловероятно),
-			// возвращаем "{}" или пустую строку
+			// Если ни один GetStatsOneShot не успел вернуть хоть «нулевой» snapshot
 			statsJSON = "{}"
 		}
 	} else {
-		// Если showStats==false, просто ждём завершения и не снимаем stats
+		// Если showStats == false, просто ждём завершения контейнера
 		api.containerManager.Wait(id)
 	}
 
-	// 4) Сразу после завершения контейнера берём его логи
+	// Шаг 4: Берём логи контейнера (stdout+stderr) и возвращаем вместе со statsJSON
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get logs: %w", err)

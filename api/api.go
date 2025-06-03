@@ -19,48 +19,48 @@ func NewAPI(mgr container.Manager) *API {
 	return &API{containerManager: mgr}
 }
 
-// RunContainer запускает контейнер и «на лету» собирает stats,
-// чтобы ни один короткоживущий контейнер не ушёл с нулевыми метриками.
+// RunContainer запускает контейнер и возвращает одновременно его stdout+stderr (логи)
+// и метрики (Duration, CPUPercent, MemUsage, MemLimit, MemPercent) в виде JSON-строки.
+// Даже если контейнер живёт считанные миллисекунды, tight-loop гарантирует, что
+// мы снимем хотя бы один summary до исчезновения cgroup.
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// Шаг 1: Создаём контейнер
+	// 1) Создаём контейнер
 	id, err := api.containerManager.Create(config)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
-	// Обязательно удаляем контейнер в defer, когда всё сделаем
+	// Обязательно удалим контейнер после того, как всё сделали
 	defer api.containerManager.Remove(id)
 
-	// Шаг 2: Стартуем контейнер и фиксируем время старта
+	// 2) Стартуем контейнер и фиксируем время старта
 	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Переменная для хранения последнего «валидного» snapshot-а
+	// Переменные для сбора метрик
 	var lastSummary container.ContainerStatsSummary
 	var gotSummary bool
 	var statsJSON string
 
 	if showStats {
-		// Канал, сигнализирующий, что контейнер завершил работу
+		// Канал, который закроется, когда контейнер завершится
 		doneCh := make(chan struct{})
 
-		// Шаг 3a: Горутина, которая ждёт завершения контейнера
+		// 3a) Горутина, которая ждёт окончания контейнера
 		go func() {
 			api.containerManager.Wait(id)
 			close(doneCh)
 		}()
 
-		// Шаг 3b: Tight-loop поллинга, чтобы поймать stats пока контейнер alive
+		// 3b) Tight-loop: агрессивно вызываем GetStatsOneShot(id), пока контейнер жив
 		for {
-			// Пытаемся снять одноразовый snapshot stats
 			summary, err := api.containerManager.GetStatsOneShot(id, startTime)
 			if err == nil {
-				// Если нам вернулся хоть какой-то summary, сохраняем его
-				// (могут быть нулевые поля, но мы запомним последний snapshot)
+				// Сохраняем последний валидный снимок
 				lastSummary = summary
 				gotSummary = true
-				// Если CPU или память уже ненулевые — останавливаемся раньше
+				// Если snapshot содержит ненулевые CPU или память — выходим сразу
 				if summary.CPUPercent != 0 || summary.MemUsage != 0 {
 					break
 				}
@@ -68,22 +68,21 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 			// Проверяем, завершился ли контейнер
 			select {
 			case <-doneCh:
-				// Контейнер уже завершился — выходим из цикла
+				// контейнер завершился — выходим
 				goto AFTER_POLL
 			default:
-				// Контейнер всё ещё жив — повторяем без задержки
+				// контейнер всё ещё жив — повторяем без задержки
 			}
 		}
 
 	AFTER_POLL:
-		// Шаг 3c: Когда контейнер вышел или мы успели получить ненулевой snapshot
+		// 3c) После выхода из цикла (либо мы поймали ненулевой summary, либо контейнер завершился)
 		if gotSummary {
+			// Маршалим в JSON
 			data, _ := json.MarshalIndent(lastSummary, "", "  ")
-			// У нас в lastSummary.Duration уже лежит корректный duration
-			// (time.Since(startTime) мы сделали внутри GetStatsOneShot).
 			statsJSON = string(data)
 		} else {
-			// Если ни один GetStatsOneShot не успел вернуть хоть «нулевой» snapshot
+			// Если не удалось ни разу снять даже «нулевой» snapshot
 			statsJSON = "{}"
 		}
 	} else {
@@ -91,7 +90,9 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 		api.containerManager.Wait(id)
 	}
 
-	// Шаг 4: Берём логи контейнера (stdout+stderr) и возвращаем вместе со statsJSON
+	// 4) После того как контейнер завершился, получаем его логи
+	//    (stdout + stderr). Делаем это _после_ цикла polling, потому что
+	//    мы хотим, чтобы контейнер всё ещё существовал.
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get logs: %w", err)

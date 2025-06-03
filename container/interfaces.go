@@ -2,7 +2,6 @@ package container
 
 import (
 	"github.com/docker/docker/api/types/container"
-	"time"
 )
 
 // Manager interface with methods to manage containers
@@ -15,12 +14,6 @@ type Manager interface {
 	Wait(id string) (container.WaitResponse, error)
 	IsRunning(id string) (bool, error)
 	GetStats(containerID string) (string, error)
-	GetStatsStreamed(
-		containerID string,
-		startTime time.Time,
-		resultCh chan<- ContainerStatsSummary,
-		errCh chan<- error,
-	)
 	EnsureImage(image string) error
 	Ping() error
 }

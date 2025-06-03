@@ -202,7 +202,7 @@ func (dm *DockerManager) Ping() error {
 	return err
 }
 
-// Monitor: на "start" сохраняем PID и relPaths, на "die" читаем stats и сразу выводим логи.
+// Monitor: теперь первым делом на "die" печатаем логи, а уже потом — ресурсы.
 func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -226,37 +226,40 @@ func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
 		case msg := <-messages:
 			switch msg.Action {
 			case "start":
-				// Сразу после старта сохраняем PID и relPaths
+				// Собираем PID и relPaths сразу при старте
 				pid, relPaths, fetchErr := fetchCgroupInfo(ctx, cli, msg.ID)
 				if fetchErr != nil {
 					log.Printf("fetchCgroupInfo(%s) error: %v\n", msg.ID, fetchErr)
+					// Но даже если не удалось, просто не сохраняем в infos
 					continue
 				}
 				relPaths["__start_time"] = time.Unix(msg.Time, 0).Format(time.RFC3339Nano)
 				infos[msg.ID] = cgroupInfo{pid: pid, relPaths: relPaths}
 
 			case "die":
+				// Сначала печатаем логи контейнера, даже если cgroupInfo нет или он невалиден
+				printContainerLogs(ctx, cli, msg.ID)
+
+				// Затем пытаемся снять метрики, если у нас есть cgroupInfo
 				info, ok := infos[msg.ID]
 				if !ok {
-					continue
+					log.Printf("no cgroupInfo for %s, skip stats\n", msg.ID)
+					break
 				}
 				// Парсим время старта
 				stStr := info.relPaths["__start_time"]
-				startTime, _ := time.Parse(time.RFC3339Nano, stStr)
+				startTime, err := time.Parse(time.RFC3339Nano, stStr)
+				if err != nil {
+					startTime = time.Unix(msg.Time, 0)
+				}
 				endTime := time.Unix(msg.Time, 0)
 
-				// Снимаем метрики
 				rec, err := readStatsFromCgroup(info, msg.ID, startTime, endTime)
 				if err != nil {
 					log.Printf("readStatsFromCgroup(%s) error: %v\n", msg.ID, err)
 					delete(infos, msg.ID)
-					continue
+					break
 				}
-
-				// Печатаем логи контейнера
-				printContainerLogs(ctx, cli, msg.ID)
-
-				// Вызываем callback для stats
 				onRecord(*rec)
 				delete(infos, msg.ID)
 			}
@@ -309,89 +312,58 @@ func fetchCgroupInfo(ctx context.Context, cli *client.Client, containerID string
 	return pid, relPaths, nil
 }
 
-// readStatsFromCgroup actually reads the CPU and memory files under /sys/fs/cgroup.
-// It takes the cached cgroupInfo (pid + relPaths) we built on "start", plus start/end times.
-func readStatsFromCgroup(info cgroupInfo, containerID string, start, end time.Time) (*StatsRecord, error) {
+func readStatsFromCgroup(
+	info cgroupInfo,
+	containerID string,
+	start, end time.Time,
+) (*StatsRecord, error) {
 	relPaths := info.relPaths
-
-	// Helper to build a v1 path:
 	buildV1 := func(controller, filename string) (string, error) {
 		p, ok := relPaths[controller]
 		if !ok {
-			return "", fmt.Errorf("controller %s not found for container %s", controller, containerID)
+			return "", fmt.Errorf("controller %s not found for %s", controller, containerID)
 		}
 		return filepath.Join("/sys/fs/cgroup", controller, p, filename), nil
 	}
 
-	var (
-		cpuUsageNs    uint64
-		memUsageBytes uint64
-		memMaxBytes   uint64
-	)
-
-	// Detect cgroup v2 if relPaths[""] is set
+	var cpuUsageNs, memUsageBytes, memMaxBytes uint64
 	if unifiedPath, isV2 := relPaths[""]; isV2 {
-		// cgroup v2
-		//  - CPU:   /sys/fs/cgroup/<unifiedPath>/cpu.stat  (parse usage_usec)
-		//  - Memory:/sys/fs/cgroup/<unifiedPath>/memory.current, memory.peak
 		cpuStatPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "cpu.stat")
 		data, err := ioutil.ReadFile(cpuStatPath)
-		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", cpuStatPath, err)
-		}
-		for _, line := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(line, "usage_usec") {
-				var usec uint64
-				fmt.Sscanf(line, "usage_usec %d", &usec)
-				cpuUsageNs = usec * 1000 // µs → ns
-				break
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if strings.HasPrefix(line, "usage_usec") {
+					var usec uint64
+					fmt.Sscanf(line, "usage_usec %d", &usec)
+					cpuUsageNs = usec * 1000
+					break
+				}
 			}
 		}
-
-		curPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.current")
-		d1, err := ioutil.ReadFile(curPath)
-		if err != nil {
-			return nil, fmt.Errorf("read memory.current: %w", err)
+		memCur := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.current")
+		if d1, err := ioutil.ReadFile(memCur); err == nil {
+			fmt.Sscanf(string(d1), "%d", &memUsageBytes)
 		}
-		fmt.Sscanf(string(d1), "%d", &memUsageBytes)
-
-		peakPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.peak")
-		d2, err := ioutil.ReadFile(peakPath)
-		if err != nil {
-			return nil, fmt.Errorf("read memory.peak: %w", err)
+		memPeak := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.peak")
+		if d2, err := ioutil.ReadFile(memPeak); err == nil {
+			fmt.Sscanf(string(d2), "%d", &memMaxBytes)
 		}
-		fmt.Sscanf(string(d2), "%d", &memMaxBytes)
 	} else {
-		// cgroup v1
-		cpuPath, err := buildV1("cpu,cpuacct", "cpuacct.usage")
-		if err != nil {
-			return nil, err
+		if cpuPath, err := buildV1("cpu,cpuacct", "cpuacct.usage"); err == nil {
+			if d0, err := ioutil.ReadFile(cpuPath); err == nil {
+				fmt.Sscanf(string(d0), "%d", &cpuUsageNs)
+			}
 		}
-		d0, err := ioutil.ReadFile(cpuPath)
-		if err != nil {
-			return nil, fmt.Errorf("read cpuacct.usage: %w", err)
+		if muPath, err := buildV1("memory", "memory.usage_in_bytes"); err == nil {
+			if d1, err := ioutil.ReadFile(muPath); err == nil {
+				fmt.Sscanf(string(d1), "%d", &memUsageBytes)
+			}
 		}
-		fmt.Sscanf(string(d0), "%d", &cpuUsageNs)
-
-		muPath, err := buildV1("memory", "memory.usage_in_bytes")
-		if err != nil {
-			return nil, err
+		if mpPath, err := buildV1("memory", "memory.max_usage_in_bytes"); err == nil {
+			if d2, err := ioutil.ReadFile(mpPath); err == nil {
+				fmt.Sscanf(string(d2), "%d", &memMaxBytes)
+			}
 		}
-		d1, err := ioutil.ReadFile(muPath)
-		if err != nil {
-			return nil, fmt.Errorf("read memory.usage_in_bytes: %w", err)
-		}
-		fmt.Sscanf(string(d1), "%d", &memUsageBytes)
-
-		mpPath, err := buildV1("memory", "memory.max_usage_in_bytes")
-		if err != nil {
-			return nil, err
-		}
-		d2, err := ioutil.ReadFile(mpPath)
-		if err != nil {
-			return nil, fmt.Errorf("read memory.max_usage_in_bytes: %w", err)
-		}
-		fmt.Sscanf(string(d2), "%d", &memMaxBytes)
 	}
 
 	return &StatsRecord{
@@ -405,13 +377,12 @@ func readStatsFromCgroup(info cgroupInfo, containerID string, start, end time.Ti
 	}, nil
 }
 
-// printContainerLogs просто читает stdout+stderr и выводит в консоль.
+// printContainerLogs читает stdout+stderr контейнера и сразу пишет в консоль.
 func printContainerLogs(ctx context.Context, cli *client.Client, containerID string) {
 	reader, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Timestamps: false,
-		Follow:     false, // сразу получить всё и закрыть
+		Follow:     false, // сразу получить весь лог и закрыть
 	})
 	if err != nil {
 		log.Printf("ContainerLogs(%s) error: %v\n", containerID, err)
@@ -419,14 +390,12 @@ func printContainerLogs(ctx context.Context, cli *client.Client, containerID str
 	}
 	defer reader.Close()
 
-	// Docker multiplexes stdout+stderr; используем stdcopy для разделения потоков
 	var stdoutBuf, stderrBuf bytes.Buffer
 	if _, err := stdcopy.StdCopy(&stdoutBuf, &stderrBuf, reader); err != nil {
 		log.Printf("StdCopy error for %s: %v\n", containerID, err)
 		return
 	}
 
-	// Печатаем сначала stdout, потом stderr (при желании можно объеденить)
 	outStr := strings.TrimRight(stdoutBuf.String(), "\n")
 	errStr := strings.TrimRight(stderrBuf.String(), "\n")
 	if outStr != "" {

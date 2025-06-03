@@ -19,80 +19,66 @@ func NewAPI(mgr container.Manager) *API {
 	return &API{containerManager: mgr}
 }
 
-// RunContainer запускает контейнер и возвращает одновременно его stdout+stderr (логи)
-// и метрики (Duration, CPUPercent, MemUsage, MemLimit, MemPercent) в виде JSON-строки.
-// Даже если контейнер живёт считанные миллисекунды, tight-loop гарантирует, что
-// мы снимем хотя бы один summary до исчезновения cgroup.
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
 	// 1) Создаём контейнер
 	id, err := api.containerManager.Create(config)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
-	// Обязательно удалим контейнер после того, как всё сделали
 	defer api.containerManager.Remove(id)
 
-	// 2) Стартуем контейнер и фиксируем время старта
+	// 2) Стартуем контейнер
 	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	// Переменные для сбора метрик
+	// 3) Переменные для метрик
 	var lastSummary container.ContainerStatsSummary
 	var gotSummary bool
 	var statsJSON string
 
 	if showStats {
-		// Канал, который закроется, когда контейнер завершится
+		// Канал, закрывающийся после Wait
 		doneCh := make(chan struct{})
-
-		// 3a) Горутина, которая ждёт окончания контейнера
 		go func() {
 			api.containerManager.Wait(id)
 			close(doneCh)
 		}()
 
-		// 3b) Tight-loop: агрессивно вызываем GetStatsOneShot(id), пока контейнер жив
+		// Tight‐loop: пока контейнер жив, вызываем GetStatsOneShot без задержки
 		for {
 			summary, err := api.containerManager.GetStatsOneShot(id, startTime)
 			if err == nil {
-				// Сохраняем последний валидный снимок
 				lastSummary = summary
 				gotSummary = true
-				// Если snapshot содержит ненулевые CPU или память — выходим сразу
-				if summary.CPUPercent != 0 || summary.MemUsage != 0 {
+				// Как только сырое CPUUsageNs окажется ненулевым, выходим.
+				if summary.CPUUsageNs != 0 {
 					break
 				}
 			}
-			// Проверяем, завершился ли контейнер
 			select {
 			case <-doneCh:
-				// контейнер завершился — выходим
+				// контейнер упал → выходим
 				goto AFTER_POLL
 			default:
-				// контейнер всё ещё жив — повторяем без задержки
+				// контейнер всё ещё жив → цикл снова
 			}
 		}
-
 	AFTER_POLL:
-		// 3c) После выхода из цикла (либо мы поймали ненулевой summary, либо контейнер завершился)
 		if gotSummary {
-			// Маршалим в JSON
-			data, _ := json.MarshalIndent(lastSummary, "", "  ")
-			statsJSON = string(data)
+			b, _ := json.MarshalIndent(lastSummary, "", "  ")
+			statsJSON = string(b)
 		} else {
-			// Если не удалось ни разу снять даже «нулевой» snapshot
 			statsJSON = "{}"
 		}
 	} else {
-		// Если showStats == false, просто ждём завершения контейнера
+		// showStats == false — просто ждём
 		api.containerManager.Wait(id)
 	}
 
-	// 4) После того как контейнер завершился, получаем его логи
-	//    (stdout + stderr). Делаем это _после_ цикла polling, потому что
-	//    мы хотим, чтобы контейнер всё ещё существовал.
+	// 4) Логи: читаем их только **после** того как контейнер уже завершился,
+	// но перед тем, как мы уйдём из функции и контейнер при этом фактически удалится.
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get logs: %w", err)

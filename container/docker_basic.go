@@ -39,15 +39,19 @@ type StatsRecord struct {
 }
 
 type ContainerStatsSummary struct {
-	// raw Duration в наносекундах мы не выводим:
-	Duration time.Duration `json:"-"`
+	Duration    time.Duration `json:"-"`        // raw в наносекундах (не выводим)
+	DurationStr string        `json:"Duration"` // человекочитаемый
 
-	// Это поле будет выводиться в JSON:
-	DurationStr string `json:"Duration"`
-
+	// CPU мы теперь храним в nanoseconds (чтобы никогда не было нуля),
+	// а уже в JSON конвертируем его в проценты вручную
+	CPUUsageNs uint64  `json:"CPUUsageNs"`
 	CPUPercent float64 `json:"CPUPercent"`
-	MemUsage   uint64  `json:"MemUsage"`
-	MemLimit   uint64  `json:"MemLimit"`
+
+	// Память храним в байтах, а в JSON делим на 1024, чтобы вывести в kilobytes
+	MemUsage   uint64  `json:"-"`
+	MemLimit   uint64  `json:"-"`
+	MemUsageKB uint64  `json:"MemUsageKB"`
+	MemLimitKB uint64  `json:"MemLimitKB"`
 	MemPercent float64 `json:"MemPercent"`
 }
 
@@ -433,36 +437,49 @@ func (dm *DockerManager) GetStatsOneShot(containerID string, startTime time.Time
 		return ContainerStatsSummary{}, fmt.Errorf("read stats body failed: %w", err)
 	}
 
+	// Распарсим в стандартную StatsResponse
 	var sr container.StatsResponse
 	if err := json.Unmarshal(raw, &sr); err != nil {
 		return ContainerStatsSummary{}, fmt.Errorf("unmarshal stats response failed: %w", err)
 	}
 
-	// 1) CPU%
+	// 1) Берём «сырое» CPU в наносекундах
+	cpuUsageNs := sr.CPUStats.CPUUsage.TotalUsage
+
+	// 2) Дополнительно считаем CPU% (как раньше)
 	cpuPercent := 0.0
-	cpuDelta := float64(sr.CPUStats.CPUUsage.TotalUsage) - float64(sr.PreCPUStats.CPUUsage.TotalUsage)
-	systemDelta := float64(sr.CPUStats.SystemUsage) - float64(sr.PreCPUStats.SystemUsage)
+	cpuDelta := float64(sr.CPUStats.CPUUsage.TotalUsage) -
+		float64(sr.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(sr.CPUStats.SystemUsage) -
+		float64(sr.PreCPUStats.SystemUsage)
 	if systemDelta > 0 && cpuDelta > 0 {
-		cpuPercent = (cpuDelta / systemDelta) * float64(len(sr.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+		cpuPercent = (cpuDelta / systemDelta) *
+			float64(len(sr.CPUStats.CPUUsage.PercpuUsage)) * 100.0
 	}
 
-	// 2) Память
+	// 3) Память в байтах
 	memUsage := sr.MemoryStats.Usage
 	memLimit := sr.MemoryStats.Limit
+
+	// 4) Пересчитаем в KB
+	memUsageKB := memUsage / 1024
+	memLimitKB := memLimit / 1024
+
 	memPercent := 0.0
 	if memLimit > 0 {
 		memPercent = (float64(memUsage) / float64(memLimit)) * 100.0
 	}
 
-	// 3) Duration и человекочитаемая строка
 	dur := time.Since(startTime)
-
 	return ContainerStatsSummary{
 		Duration:    dur,
-		DurationStr: dur.String(), // <-- это и попадёт в JSON
+		DurationStr: dur.String(),
+		CPUUsageNs:  cpuUsageNs,
 		CPUPercent:  cpuPercent,
 		MemUsage:    memUsage,
 		MemLimit:    memLimit,
+		MemUsageKB:  memUsageKB,
+		MemLimitKB:  memLimitKB,
 		MemPercent:  memPercent,
 	}, nil
 }

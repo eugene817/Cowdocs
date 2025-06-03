@@ -29,7 +29,6 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
 	// Будем удалять контейнер только после того, как прочитаем логи и stats.
-	defer api.containerManager.Remove(id)
 
 	// 2) Start
 	startTime := time.Now()
@@ -86,6 +85,8 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get logs: %w", err)
 	}
+
+	defer api.containerManager.Remove(id)
 
 	// 5) Возвращаем: сначала логи, потом statsJSON
 	return logs, statsJSON, nil

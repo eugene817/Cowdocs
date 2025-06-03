@@ -27,12 +27,22 @@ type DockerManager struct {
 	cli *client.Client
 }
 
-// ContainerStatsSummary holds the aggregated stats we want at container exit.
-type ContainerStatsSummary struct {
-	Duration       time.Duration // Total time the container ran
-	LastMemUsage   uint64        // Memory usage in the last stats frame (bytes)
-	PeakMemUsage   uint64        // Peak memory usage over the container’s lifetime (bytes)
-	LastCPUPercent float64       // CPU percentage in the last stats frame
+// StatsRecord holds the final stats for one container run.
+type StatsRecord struct {
+	ID            string        `json:"id"`
+	StartTime     time.Time     `json:"start_time"`
+	EndTime       time.Time     `json:"end_time"`
+	Duration      time.Duration `json:"duration"`
+	CPUUsageNs    uint64        `json:"cpu_usage_ns"`
+	MemUsageBytes uint64        `json:"mem_usage_bytes"`
+	MemMaxBytes   uint64        `json:"mem_max_bytes"`
+}
+
+// cgroupInfo stores the cgroup‐related data we need for a running container.
+// We fill this on the "start" event.
+type cgroupInfo struct {
+	pid      int               // host PID of the container’s init process
+	relPaths map[string]string // controller → relative cgroup path (e.g. "/docker/<outer>/docker/<id>")
 }
 
 // Docker manager constructor
@@ -192,106 +202,27 @@ func (dm *DockerManager) Ping() error {
 	return err
 }
 
-func (dm *DockerManager) GetStatsStreamed(
-	containerID string,
-	startTime time.Time,
-	resultCh chan<- ContainerStatsSummary,
-	errCh chan<- error,
-) {
-	ctx := context.Background()
-
-	// 1. Open streaming stats (stream=true)
-	resp, err := dm.cli.ContainerStats(ctx, containerID, true)
-	if err != nil {
-		errCh <- fmt.Errorf("failed to open stats stream: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	decoder := json.NewDecoder(resp.Body)
-
-	// 2. Decode frames into container.StatsResponse (not types.StatsJSON)
-	var (
-		frame   container.StatsResponse
-		peakMem uint64 = 0
-		lastMem uint64 = 0
-		lastCPU float64
-	)
-
-	// 3. Loop until EOF (container exit)
-	for {
-		if err := decoder.Decode(&frame); err != nil {
-			if err == io.EOF {
-				// streaming closed because container exited
-				break
-			}
-			errCh <- fmt.Errorf("error decoding stats frame: %v", err)
-			return
-		}
-
-		// 4. Update peak memory and last memory
-		used := frame.MemoryStats.Usage
-		if used > peakMem {
-			peakMem = used
-		}
-		lastMem = used
-
-		// 5. Compute CPU% using Docker’s formula:
-		cpuDelta := float64(frame.CPUStats.CPUUsage.TotalUsage) -
-			float64(frame.PreCPUStats.CPUUsage.TotalUsage)
-		systemDelta := float64(frame.CPUStats.SystemUsage) -
-			float64(frame.PreCPUStats.SystemUsage)
-		cpuPercent := 0.0
-		if systemDelta > 0 && cpuDelta > 0 {
-			cpuPercent = (cpuDelta / systemDelta) *
-				float64(len(frame.CPUStats.CPUUsage.PercpuUsage)) * 100.0
-		}
-		lastCPU = cpuPercent
-	}
-
-	// 6. Once EOF is reached, the container has exited; compute duration
-	duration := time.Since(startTime)
-
-	// 7. Send summary on resultCh
-	resultCh <- ContainerStatsSummary{
-		Duration:       duration,
-		LastMemUsage:   lastMem,
-		PeakMemUsage:   peakMem,
-		LastCPUPercent: lastCPU,
-	}
-}
-
-// StatsRecord must match (or be convertible from) container.ContainerStatsSummary
-type StatsRecord struct {
-	ID            string        `json:"id"`
-	StartTime     time.Time     `json:"start_time"`
-	EndTime       time.Time     `json:"end_time"`
-	Duration      time.Duration `json:"duration"`
-	CPUUsageNs    uint64        `json:"cpu_usage_ns"`
-	MemUsageBytes uint64        `json:"mem_usage_bytes"`
-	MemMaxBytes   uint64        `json:"mem_max_bytes"`
-}
-
-// Monitor listens for Docker "start" and "die" events. When a container dies,
-// it calls onRecord(StatsRecord) with the metrics just collected.
+// Monitor listens for Docker "start" and "die" events. As soon as a container dies,
+// it uses the pre‐cached cgroupInfo (collected on "start") to read exactly the right files
+// under /sys/fs/cgroup and invokes onRecord(rec).
 func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
-	// 1) Create a Docker client
+	// 1) New Docker client
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return fmt.Errorf("could not create Docker client: %w", err)
 	}
 	defer cli.Close()
 
-	// 2) Keep a map containerID → start time
-	startTimes := make(map[string]time.Time)
+	// 2) Map containerID → cgroupInfo (pid + relPaths)
+	infos := make(map[string]cgroupInfo)
 
-	// 3) Build filters to only receive "container start" and "container die" events
+	// 3) Build filters to only get "container start" and "container die"
 	filterArgs := filters.NewArgs()
 	filterArgs.Add("type", "container")
 	filterArgs.Add("event", "start")
 	filterArgs.Add("event", "die")
 
-	// 4) Subscribe to events (use events.ListOptions with filterArgs)
+	// 4) Subscribe to events
 	messages, errs := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
 
 	for {
@@ -300,69 +231,84 @@ func Monitor(ctx context.Context, onRecord func(rec StatsRecord)) error {
 			return fmt.Errorf("error from Docker events: %w", err)
 
 		case msg := <-messages:
-			// msg.Action is "start" or "die"; msg.Time is int64 UNIX seconds
 			switch msg.Action {
 			case "start":
-				// Record the start timestamp
-				startTimes[msg.ID] = time.Unix(msg.Time, 0)
+				// As soon as the container enters "running", capture its PID + cgroup paths
+				st := time.Unix(msg.Time, 0)
+				pid, relPaths, err := fetchCgroupInfo(ctx, cli, msg.ID)
+				if err != nil {
+					log.Printf("fetchCgroupInfo(%s) error: %v\n", msg.ID, err)
+					// If we fail to fetch cgroup info, we skip storing it.
+					// We will not be able to collect metrics on die, but at least the app continues.
+					continue
+				}
+				infos[msg.ID] = cgroupInfo{pid: pid, relPaths: relPaths}
+				// Note: we also need to record start time so we can compute duration on "die"
+				// We'll overwrite infos[msg.ID] below, so let's keep start time in relPaths under a sentinel key:
+				relPaths["__start_time"] = st.Format(time.RFC3339Nano)
 
 			case "die":
-				// Container has stopped
-				st, ok := startTimes[msg.ID]
+				// When container dies, look up its stored cgroupInfo
+				info, ok := infos[msg.ID]
 				if !ok {
-					// Missed “start” event? Skip.
+					// We never saw a "start" or failed to fetch info. Skip.
 					continue
+				}
+				// Parse the recorded start time:
+				stStr := info.relPaths["__start_time"]
+				startTime, err := time.Parse(time.RFC3339Nano, stStr)
+				if err != nil {
+					// If the stored start time parsing fails, default to msg.Time
+					startTime = time.Unix(msg.Time, 0)
 				}
 				endTime := time.Unix(msg.Time, 0)
 
-				// Gather cgroup metrics dynamically
-				rec, err := captureMetrics(ctx, cli, msg.ID, st, endTime)
+				// Now gather CPU + Memory using the cached cgroupInfo
+				rec, err := readStatsFromCgroup(info, msg.ID, startTime, endTime)
 				if err != nil {
-					// Log the error, but continue handling other events
-					log.Printf("captureMetrics(%s) error: %v\n", msg.ID, err)
-					delete(startTimes, msg.ID)
+					log.Printf("error reading stats for %s: %v\n", msg.ID, err)
+					delete(infos, msg.ID)
 					continue
 				}
-				// Invoke the user-supplied callback
+
+				// Invoke the callback
 				onRecord(*rec)
 
-				delete(startTimes, msg.ID)
+				// Cleanup
+				delete(infos, msg.ID)
 			}
 		case <-ctx.Done():
 			return nil
 		}
 	}
 }
-func captureMetrics(
-	ctx context.Context,
-	cli *client.Client,
-	containerID string,
-	start, end time.Time,
-) (*StatsRecord, error) {
-	// 1) Inspect container to find its PID in the host namespace
+
+// fetchCgroupInfo inspects a container to find its host PID, then reads /proc/<pid>/cgroup
+// to build a map: controller → relative cgroup path. This is called on the "start" event.
+//
+// Returns (pid, relPaths, error).
+func fetchCgroupInfo(ctx context.Context, cli *client.Client, containerID string) (int, map[string]string, error) {
 	insp, err := cli.ContainerInspect(ctx, containerID)
 	if err != nil {
-		return nil, fmt.Errorf("ContainerInspect(%s) failed: %w", containerID, err)
+		return 0, nil, fmt.Errorf("ContainerInspect(%s) failed: %w", containerID, err)
 	}
 	pid := insp.State.Pid
 	if pid <= 0 {
-		return nil, fmt.Errorf("invalid PID %d for container %s", pid, containerID)
+		return 0, nil, fmt.Errorf("invalid PID %d for container %s", pid, containerID)
 	}
 
-	// 2) Read /proc/<pid>/cgroup to get relative cgroup paths under each controller
+	// Read /proc/<pid>/cgroup
 	cgFile := fmt.Sprintf("/proc/%d/cgroup", pid)
 	f, err := os.Open(cgFile)
 	if err != nil {
-		return nil, fmt.Errorf("could not open %s: %w", cgFile, err)
+		return pid, nil, fmt.Errorf("could not open %s: %w", cgFile, err)
 	}
 	defer f.Close()
 
-	// relPaths maps “controller” → relative cgroup path (e.g. “/docker/<outer>/docker/<id>”)
 	relPaths := make(map[string]string)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		line := scanner.Text()
-		// Format: “<hierarchyID>:<controllers>:<relativePath>”
 		parts := strings.SplitN(line, ":", 3)
 		if len(parts) != 3 {
 			continue
@@ -374,16 +320,24 @@ func captureMetrics(
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading %s: %w", cgFile, err)
+		return pid, relPaths, fmt.Errorf("scanner error on %s: %w", cgFile, err)
 	}
 
-	// Helper: builds a full cgroup v1 path, given a controller and a filename.
-	buildV1Path := func(controller, filename string) (string, error) {
-		rp, ok := relPaths[controller]
+	return pid, relPaths, nil
+}
+
+// readStatsFromCgroup actually reads the CPU and memory files under /sys/fs/cgroup.
+// It takes the cached cgroupInfo (pid + relPaths) we built on "start", plus start/end times.
+func readStatsFromCgroup(info cgroupInfo, containerID string, start, end time.Time) (*StatsRecord, error) {
+	relPaths := info.relPaths
+
+	// Helper to build a v1 path:
+	buildV1 := func(controller, filename string) (string, error) {
+		p, ok := relPaths[controller]
 		if !ok {
-			return "", fmt.Errorf("controller %s not found for PID %d", controller, pid)
+			return "", fmt.Errorf("controller %s not found for container %s", controller, containerID)
 		}
-		return filepath.Join("/sys/fs/cgroup", controller, rp, filename), nil
+		return filepath.Join("/sys/fs/cgroup", controller, p, filename), nil
 	}
 
 	var (
@@ -392,85 +346,71 @@ func captureMetrics(
 		memMaxBytes   uint64
 	)
 
-	// 3) Determine whether we’re on cgroup v2 (unified) or v1.
-	//    In v2, relPaths[""] will be non‐empty (empty controller field).
+	// Detect cgroup v2 if relPaths[""] is set
 	if unifiedPath, isV2 := relPaths[""]; isV2 {
-		// **cgroup v2 logic**:
-		//   - CPU usage: /sys/fs/cgroup/<unifiedPath>/cpu.stat → “usage_usec <n>”
-		//   - Memory usage: /sys/fs/cgroup/<unifiedPath>/memory.current
-		//   - Memory peak:  /sys/fs/cgroup/<unifiedPath>/memory.peak
-
-		// 3a) CPU (read cpu.stat → usage_usec → convert to nanoseconds)
-		cpuStat := filepath.Join("/sys/fs/cgroup", unifiedPath, "cpu.stat")
-		data, err := ioutil.ReadFile(cpuStat)
+		// cgroup v2
+		//  - CPU:   /sys/fs/cgroup/<unifiedPath>/cpu.stat  (parse usage_usec)
+		//  - Memory:/sys/fs/cgroup/<unifiedPath>/memory.current, memory.peak
+		cpuStatPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "cpu.stat")
+		data, err := ioutil.ReadFile(cpuStatPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", cpuStat, err)
+			return nil, fmt.Errorf("could not read %s: %w", cpuStatPath, err)
 		}
-		for _, ln := range strings.Split(string(data), "\n") {
-			if strings.HasPrefix(ln, "usage_usec") {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "usage_usec") {
 				var usec uint64
-				fmt.Sscanf(ln, "usage_usec %d", &usec)
+				fmt.Sscanf(line, "usage_usec %d", &usec)
 				cpuUsageNs = usec * 1000 // µs → ns
 				break
 			}
 		}
 
-		// 3b) Current memory usage
-		memCur := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.current")
-		d1, err := ioutil.ReadFile(memCur)
+		curPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.current")
+		d1, err := ioutil.ReadFile(curPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", memCur, err)
+			return nil, fmt.Errorf("read memory.current: %w", err)
 		}
 		fmt.Sscanf(string(d1), "%d", &memUsageBytes)
 
-		// 3c) Peak memory usage
-		memPeak := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.peak")
-		d2, err := ioutil.ReadFile(memPeak)
+		peakPath := filepath.Join("/sys/fs/cgroup", unifiedPath, "memory.peak")
+		d2, err := ioutil.ReadFile(peakPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", memPeak, err)
+			return nil, fmt.Errorf("read memory.peak: %w", err)
 		}
 		fmt.Sscanf(string(d2), "%d", &memMaxBytes)
 	} else {
-		// **cgroup v1 logic**:
-		//   - CPU:    /sys/fs/cgroup/cpu,cpuacct/<relPaths["cpu,cpuacct"]>/cpuacct.usage
-		//   - Memory: /sys/fs/cgroup/memory/<relPaths["memory"]>/memory.usage_in_bytes
-		//             /sys/fs/cgroup/memory/<relPaths["memory"]>/memory.max_usage_in_bytes
-
-		// 3d) CPU usage v1
-		cpuPath, err := buildV1Path("cpu,cpuacct", "cpuacct.usage")
+		// cgroup v1
+		cpuPath, err := buildV1("cpu,cpuacct", "cpuacct.usage")
 		if err != nil {
 			return nil, err
 		}
 		d0, err := ioutil.ReadFile(cpuPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", cpuPath, err)
+			return nil, fmt.Errorf("read cpuacct.usage: %w", err)
 		}
 		fmt.Sscanf(string(d0), "%d", &cpuUsageNs)
 
-		// 3e) Memory usage v1
-		muPath, err := buildV1Path("memory", "memory.usage_in_bytes")
+		muPath, err := buildV1("memory", "memory.usage_in_bytes")
 		if err != nil {
 			return nil, err
 		}
 		d1, err := ioutil.ReadFile(muPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", muPath, err)
+			return nil, fmt.Errorf("read memory.usage_in_bytes: %w", err)
 		}
 		fmt.Sscanf(string(d1), "%d", &memUsageBytes)
 
-		// 3f) Memory peak v1
-		mpPath, err := buildV1Path("memory", "memory.max_usage_in_bytes")
+		mpPath, err := buildV1("memory", "memory.max_usage_in_bytes")
 		if err != nil {
 			return nil, err
 		}
 		d2, err := ioutil.ReadFile(mpPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not read %s: %w", mpPath, err)
+			return nil, fmt.Errorf("read memory.max_usage_in_bytes: %w", err)
 		}
 		fmt.Sscanf(string(d2), "%d", &memMaxBytes)
 	}
 
-	// 4) Build and return StatsRecord
 	return &StatsRecord{
 		ID:            containerID,
 		StartTime:     start,

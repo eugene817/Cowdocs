@@ -1,8 +1,10 @@
 package api
 
 import (
+	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/eugene817/Cowdocs/container"
 )
@@ -27,17 +29,28 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 	}
 	defer api.containerManager.Remove(id)
 
+	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %v", err)
 	}
 
-	statsReturn, err := api.containerManager.GetStats(id)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get stats: %v", err)
-	}
+	// statsReturn, err := api.containerManager.GetStats(id)
+	// if err != nil {
+	// 	return "", "", fmt.Errorf("failed to get stats: %v", err)
+	// }
 
 	if _, err := api.containerManager.Wait(id); err != nil {
 		return "", "", fmt.Errorf("failed to wait for container: %v", err)
+	}
+	var statsJSON string
+	if showStats {
+		summary, err := api.containerManager.GetStatsOneShot(id, startTime)
+		if err != nil {
+			return "", "", fmt.Errorf("failed to collect stats: %w", err)
+		}
+
+		data, _ := json.MarshalIndent(summary, "", "  ")
+		statsJSON = string(data)
 	}
 
 	logs, err := api.containerManager.GetLogs(id)
@@ -46,7 +59,7 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 	}
 
 	if showStats {
-		return logs, statsReturn, nil
+		return logs, statsJSON, nil
 	}
 	return logs, "", nil
 }

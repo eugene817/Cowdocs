@@ -38,6 +38,15 @@ type StatsRecord struct {
 	MemMaxBytes   uint64        `json:"mem_max_bytes"`
 }
 
+// ContainerStatsSummary — структура, в которую мы запомним итоговые цифры.
+type ContainerStatsSummary struct {
+	Duration   time.Duration // сколько контейнер жил
+	CPUPercent float64       // CPU% на момент снимка
+	MemUsage   uint64        // текущее потребление памяти (bytes)
+	MemLimit   uint64        // лимит памяти (bytes) — будет удобно для процента
+	MemPercent float64       // процент использования памяти (например, 0.1234 => 12.34%)
+}
+
 // cgroupInfo stores the cgroup‐related data we need for a running container.
 // We fill this on the "start" event.
 type cgroupInfo struct {
@@ -404,4 +413,64 @@ func printContainerLogs(ctx context.Context, cli *client.Client, containerID str
 	if errStr != "" {
 		log.Printf("Logs of %s (stderr):\n%s\n", containerID, errStr)
 	}
+}
+
+// GetStatsOneShot получает «одноразовый» снимок stats сразу после exit.
+// Его удобно вызывать ПОСЛЕ Wait, но до того, как вы удалите контейнер.
+func (dm *DockerManager) GetStatsOneShot(containerID string, startTime time.Time) (ContainerStatsSummary, error) {
+	ctx := context.Background()
+
+	// 1) Сделать одноразовый запрос stats
+	statsBody, err := dm.cli.ContainerStatsOneShot(ctx, containerID)
+	if err != nil {
+		return ContainerStatsSummary{}, fmt.Errorf("ContainerStatsOneShot failed: %w", err)
+	}
+	defer statsBody.Body.Close()
+
+	// 2) Прочитать весь JSON из Body
+	raw, err := io.ReadAll(statsBody.Body)
+	if err != nil {
+		return ContainerStatsSummary{}, fmt.Errorf("read stats body failed: %w", err)
+	}
+
+	// 3) Распарсить его в container.StatsResponse
+	var sr container.StatsResponse
+	if err := json.Unmarshal(raw, &sr); err != nil {
+		return ContainerStatsSummary{}, fmt.Errorf("unmarshal stats response failed: %w", err)
+	}
+
+	// 4) Найти CPU%
+	//
+	//    Формула Docker CPU%:
+	//      cpuDelta    = sr.CPUStats.CPUUsage.TotalUsage - sr.PreCPUStats.CPUUsage.TotalUsage
+	//      systemDelta = sr.CPUStats.SystemUsage  - sr.PreCPUStats.SystemUsage
+	//      cpuPercent  = (cpuDelta / systemDelta) * len(PercpuUsage) * 100
+	//
+	cpuPercent := 0.0
+	cpuDelta := float64(sr.CPUStats.CPUUsage.TotalUsage) - float64(sr.PreCPUStats.CPUUsage.TotalUsage)
+	systemDelta := float64(sr.CPUStats.SystemUsage) - float64(sr.PreCPUStats.SystemUsage)
+	if systemDelta > 0 && cpuDelta > 0 {
+		cpuPercent = (cpuDelta / systemDelta) * float64(len(sr.CPUStats.CPUUsage.PercpuUsage)) * 100.0
+	}
+
+	// 5) Найти использование памяти
+	//
+	//    sr.MemoryStats.Usage     → текущее потребление (bytes)
+	//    sr.MemoryStats.Limit     → лимит контейнера (bytes)
+	//    какую долю от лимита занято:
+	memUsage := sr.MemoryStats.Usage
+	memLimit := sr.MemoryStats.Limit
+	memPercent := 0.0
+	if memLimit > 0 {
+		memPercent = (float64(memUsage) / float64(memLimit)) * 100.0
+	}
+
+	// 6) Составляем итоговую структуру
+	return ContainerStatsSummary{
+		Duration:   time.Since(startTime),
+		CPUPercent: cpuPercent,
+		MemUsage:   memUsage,
+		MemLimit:   memLimit,
+		MemPercent: memPercent,
+	}, nil
 }

@@ -14,98 +14,63 @@ type API struct {
 	containerManager container.Manager
 }
 
-// Function to create a new API instance
-func NewAPI(mgr container.Manager) *API {
-	return &API{containerManager: mgr}
-}
-
-// RunContainer запускает контейнер, собирает метрики и логи, и возвращает оба результата.
-//
-//	logs — это stdout+stderr контейнера.
-//	statsJSON — это JSON со статистикой (DurationStr, CPUUsageNs, CPUPercent, MemUsageKB, MemLimitKB, MemPercent).
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// 1) Создаём контейнер
-	id, err := api.containerManager.Create(config)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create container: %w", err)
-	}
-	// Удалим контейнер, когда выйдем из этой функции.
-	// Размещаем defer сразу же, чтобы не забыть.
-	defer api.containerManager.Remove(id)
+    // 1) Создаём контейнер
+    id, err := api.containerManager.Create(config)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to create container: %w", err)
+    }
+    defer api.containerManager.Remove(id)
 
-	// 2) Стартуем контейнер и запоминаем время старта для метрик
-	startTime := time.Now()
-	if err := api.containerManager.Start(id); err != nil {
-		return "", "", fmt.Errorf("failed to start container: %w", err)
-	}
+    // 2) Стартуем контейнер и запоминаем время старта
+    startTime := time.Now()
+    if err := api.containerManager.Start(id); err != nil {
+        return "", "", fmt.Errorf("failed to start container: %w", err)
+    }
 
-	// 3) Собираем метрики, если нужно
-	var lastSummary container.ContainerStatsSummary
-	var gotSummary bool
-	var statsJSON string
+    var statsJSON string
+    if showStats {
+        // 3a) Первичный снэпшот сразу после запуска
+        initial, err := api.containerManager.GetStatsOneShot(id, startTime)
+        if err != nil {
+            return "", "", fmt.Errorf("failed to get initial stats: %w", err)
+        }
 
-	if showStats {
-		// Канал, который закроется, когда контейнер полностью завершится
-		doneCh := make(chan struct{})
+        // 3b) Ждём завершения контейнера
+        api.containerManager.Wait(id)
 
-		// 3a) Запустим горутину, которая ждёт сигнала о завершении контейнера
-		go func() {
-			// Один единственный Wait вызываем именно здесь
-			api.containerManager.Wait(id)
-			close(doneCh)
-		}()
+        // 3c) Финальный снэпшот
+        final, err := api.containerManager.GetStatsOneShot(id, startTime)
+        if err != nil {
+            return "", "", fmt.Errorf("failed to get final stats: %w", err)
+        }
 
-		// 3b) Tight‐loop polling: пока контейнер ещё “живой”, вызываем GetStatsOneShot
-		for {
-			// Пытаемся снять любой snapshot
-			summary, err := api.containerManager.GetStatsOneShot(id, startTime)
-			if err == nil {
-				lastSummary = summary
-				gotSummary = true
-				// Как только “сырое” CPUUsageNs станет ненулевым, можно выйти из цикла
-				if summary.CPUUsageNs != 0 {
-					break
-				}
-			}
-			// Проверяем, завершился ли контейнер. Если да — выходим
-			select {
-			case <-doneCh:
-				goto AFTER_POLL
-			default:
-				// Иначе без задержки повторяем опрос
-			}
-		}
+        // 3d) Вычисляем дельту
+        delta := container.ContainerStatsSummary{
+            // DurationStr можно оставить из финального снэпшота
+            DurationStr: final.DurationStr,
+            CPUUsageNs:  final.CPUUsageNs - initial.CPUUsageNs,
+            // CPUPercent считаем как относительный рост:
+            CPUPercent:  final.CPUPercent - initial.CPUPercent,
+            MemUsageKB:  final.MemUsageKB - initial.MemUsageKB,
+            MemLimitKB:  final.MemLimitKB,      // лимит не меняется
+            MemPercent:  final.MemPercent,      // процент на момент окончания
+        }
+        b, _ := json.MarshalIndent(delta, "", "  ")
+        statsJSON = string(b)
+    } else {
+        // без метрик — просто ждём
+        api.containerManager.Wait(id)
+    }
 
-		// 3c) Мы вышли из цикла потому, что CPUUsageNs != 0, но контейнер ещё может не завершиться.
-		// Нужно дождаться, пока он окончательно уйдёт (	wait до момента закрытия doneCh ).
-		<-doneCh
+    // 4) Получаем логи
+    logs, err := api.containerManager.GetLogs(id)
+    if err != nil {
+        return "", "", fmt.Errorf("failed to get logs: %w", err)
+    }
 
-	AFTER_POLL:
-		// К этому моменту контейнер либо ушёл сам (doneCh закрылся), либо мы зашли сюда, когда doneCh уже закрыт.
-		if gotSummary {
-			b, _ := json.MarshalIndent(lastSummary, "", "  ")
-			statsJSON = string(b)
-		} else {
-			statsJSON = "{}"
-		}
-	} else {
-		// Если showStats == false, просто ждём завершения контейнера здесь
-		api.containerManager.Wait(id)
-	}
-
-	// 4) Теперь, когда контейнер точно завершился, можно читать его логи.
-	//
-	//    Мы вызываем GetLogs **после** Wait, но до того, как defer Remove(id) физически уничтожит контейнер.
-	//
-	logs, err := api.containerManager.GetLogs(id)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get logs: %w", err)
-	}
-
-	// 5) Возвращаем сначала логи (stdout+stderr), потом JSON с метриками
-	return logs, statsJSON, nil
+    return logs, statsJSON, nil
 }
-
 // Function to run containers in parallel using goroutines and channels.
 // The container logs are sent to the channel.
 // Creates. Starts, Waits and Removes the container.

@@ -20,14 +20,14 @@ func NewAPI(mgr container.Manager) *API {
 }
 
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// 1) Создаём контейнер
+	// 1) Create + defer remove
 	id, err := api.containerManager.Create(config)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
 	defer api.containerManager.Remove(id)
 
-	// 2) Стартуем контейнер и запоминаем время старта
+	// 2) Start + record startTime
 	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %w", err)
@@ -35,40 +35,56 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 
 	var statsJSON string
 	if showStats {
-		// 3a) Первичный снэпшот сразу после запуска
+		// 3a) initial snapshot
 		initial, err := api.containerManager.GetStatsOneShot(id, startTime)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to get initial stats: %w", err)
 		}
 
-		// 3b) а
+		// 3b) wait for container exit
 		api.containerManager.Wait(id)
+		endTime := time.Now()
+		duration := endTime.Sub(startTime)
 
-		// 3c) Финальный снэпшот
+		// 3c) final snapshot (before removal!)
 		final, err := api.containerManager.GetStatsOneShot(id, startTime)
 		if err != nil {
 			return "", "", fmt.Errorf("failed to get final stats: %w", err)
 		}
 
-		// 3d) Вычисляем дельту
-		delta := container.ContainerStatsSummary{
-			// DurationStr можно оставить из финального снэпшота
-			DurationStr: final.DurationStr,
-			CPUUsageNs:  final.CPUUsageNs - initial.CPUUsageNs,
-			// CPUPercent считаем как относительный рост:
-			CPUPercent: final.CPUPercent - initial.CPUPercent,
-			MemUsageKB: final.MemUsageKB - initial.MemUsageKB,
-			MemLimitKB: final.MemLimitKB, // лимит не меняется
-			MemPercent: final.MemPercent, // процент на момент окончания
+		// 3d) вычисляем CPU-дельту (с защитой от underflow)
+		var cpuDeltaNs uint64
+		if final.CPUUsageNs >= initial.CPUUsageNs {
+			cpuDeltaNs = final.CPUUsageNs - initial.CPUUsageNs
+		} else {
+			// если вдруг final < initial (иногда Docker возвращает 0 после stop),
+			// считаем, что всё время было final
+			cpuDeltaNs = final.CPUUsageNs
 		}
-		b, _ := json.MarshalIndent(delta, "", "  ")
+		cpuPercent := float64(cpuDeltaNs) / float64(duration.Nanoseconds()) * 100
+
+		// 3e) память — берём финальное значение
+		memUsageKB := final.MemUsageKB
+		memLimitKB := final.MemLimitKB
+		memPercent := final.MemPercent
+
+		// 3f) собираем итоговую структуру
+		summary := container.ContainerStatsSummary{
+			DurationStr: duration.String(),
+			CPUUsageNs:  cpuDeltaNs,
+			CPUPercent:  cpuPercent,
+			MemUsageKB:  memUsageKB,
+			MemLimitKB:  memLimitKB,
+			MemPercent:  memPercent,
+		}
+
+		b, _ := json.MarshalIndent(summary, "", "  ")
 		statsJSON = string(b)
 	} else {
-		// без метрик — просто ждём
 		api.containerManager.Wait(id)
 	}
 
-	// 4) Получаем логи
+	// 4) лог
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get logs: %w", err)

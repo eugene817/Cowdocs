@@ -55,6 +55,31 @@ type ContainerStatsSummary struct {
 	MemPercent float64 `json:"MemPercent"`
 }
 
+// StatsResponse — минимальный набор полей из Docker‐статистики, которые нам нужны.
+type StatsResponse struct {
+	CPUStats struct {
+		// TotalUsage — кумулятивные наносекунды CPU
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		// SystemUsage — кумулятивные наносекунды всех ядер
+		SystemUsage uint64 `json:"system_cpu_usage"`
+	} `json:"cpu_stats"`
+
+	// PreCPUStats нужен, если ты захочешь рассчитывать %-ные изменения по docker-алгоритму
+	PreCPUStats struct {
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		SystemUsage uint64 `json:"system_cpu_usage"`
+	} `json:"precpu_stats"`
+
+	MemoryStats struct {
+		Usage uint64 `json:"usage"`
+		Limit uint64 `json:"limit"`
+	} `json:"memory_stats"`
+}
+
 // cgroupInfo stores the cgroup‐related data we need for a running container.
 // We fill this on the "start" event.
 type cgroupInfo struct {

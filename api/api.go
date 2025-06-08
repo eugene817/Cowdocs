@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	dockertypes "github.com/docker/docker/api/types"
 	"github.com/eugene817/Cowdocs/container"
 )
 
@@ -21,105 +20,125 @@ func NewAPI(mgr container.Manager) *API {
 	return &API{containerManager: mgr}
 }
 
-func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// 1) Create the container
-	id, err := api.containerManager.Create(config)
+// StatsResponse — минимальный набор полей из Docker‐статистики, которые нам нужны.
+type StatsResponse struct {
+	CPUStats struct {
+		// TotalUsage — кумулятивные наносекунды CPU
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		// SystemUsage — кумулятивные наносекунды всех ядер
+		SystemUsage uint64 `json:"system_cpu_usage"`
+	} `json:"cpu_stats"`
+
+	// PreCPUStats нужен, если ты захочешь рассчитывать %-ные изменения по docker-алгоритму
+	PreCPUStats struct {
+		CPUUsage struct {
+			TotalUsage uint64 `json:"total_usage"`
+		} `json:"cpu_usage"`
+		SystemUsage uint64 `json:"system_cpu_usage"`
+	} `json:"precpu_stats"`
+
+	MemoryStats struct {
+		Usage uint64 `json:"usage"`
+		Limit uint64 `json:"limit"`
+	} `json:"memory_stats"`
+}
+
+// RunContainer создаёт, запускает контейнер, стримит stats, ждёт финиша и возвращает логи + JSON-метрики.
+func (api *API) RunContainer(cfg container.ContainerConfig, showStats bool) (string, string, error) {
+	// 1) Create + defer Remove
+	id, err := api.containerManager.Create(cfg)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to create container: %w", err)
+		return "", "", fmt.Errorf("create: %w", err)
 	}
-	// Ensure removal on exit
 	defer api.containerManager.Remove(id)
 
-	// 2) Start + record the start time
-	startTime := time.Now()
+	// 2) Start + засечь момент старта
+	start := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
-		return "", "", fmt.Errorf("failed to start container: %w", err)
+		return "", "", fmt.Errorf("start: %w", err)
 	}
 
+	// 3) Если нужна статистика — запустить стример
 	var (
-		// We'll keep the last StatsJSON frame here
-		last      dockertypes.StatsJSON
+		last      container.StatsResponse
 		streamErr error
 		wg        sync.WaitGroup
 	)
-
 	if showStats {
-		// 3a) Open the streaming stats API (Follow=false so stream ends on container exit)
-		statsReader, err := api.containerManager.StreamStats(id)
+		statsRdr, err := api.containerManager.StreamStats(id)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to open stats stream: %w", err)
+			return "", "", fmt.Errorf("stream stats: %w", err)
 		}
-
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer statsReader.Close()
-			dec := json.NewDecoder(statsReader)
+			defer statsRdr.Close()
+			dec := json.NewDecoder(statsRdr)
 			for {
-				var sr dockertypes.StatsJSON
+				var sr container.StatsResponse
 				if err := dec.Decode(&sr); err != nil {
 					if err == io.EOF {
-						// normal end of stream
 						return
 					}
 					streamErr = err
 					return
 				}
-				last = sr // save the last valid snapshot
+				last = sr
 			}
 		}()
 	}
 
-	// 3b) Wait for the container to exit
+	// 4) Ждём, пока контейнер завершится
 	if _, err := api.containerManager.Wait(id); err != nil {
-		return "", "", fmt.Errorf("failed to wait for container: %w", err)
+		return "", "", fmt.Errorf("wait: %w", err)
 	}
-
-	// 3c) Wait for the stats‐stream goroutine to finish
+	// Дождаться статистического потока
 	if showStats {
 		wg.Wait()
 		if streamErr != nil {
-			return "", "", fmt.Errorf("error reading stats stream: %w", streamErr)
+			return "", "", fmt.Errorf("stats stream: %w", streamErr)
 		}
 	}
 
-	// 4) Collect logs
+	// 5) Собрать логи
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get logs: %w", err)
+		return "", "", fmt.Errorf("logs: %w", err)
 	}
 
-	// 5) Build JSON summary if requested
+	// 6) Пост-обработка и JSON-ответ по stats
 	var statsJSON string
 	if showStats {
-		endTime := time.Now()
-		duration := endTime.Sub(startTime)
+		end := time.Now()
+		dur := end.Sub(start)
 
-		// Cumulative CPU usage in nanoseconds
-		cpuNs := last.CPUStats.CPUUsage.TotalUsage
-		// Average CPU% over the run
-		cpuPercent := float64(cpuNs) / float64(duration.Nanoseconds()) * 100
+		// CPU
+		cpuNs := last.CPUStats.CPUUsage.TotalUsage - last.PreCPUStats.CPUUsage.TotalUsage
+		if last.PreCPUStats.CPUUsage.TotalUsage == 0 {
+			cpuNs = last.CPUStats.CPUUsage.TotalUsage
+		}
+		cpuPercent := float64(cpuNs) / float64(dur.Nanoseconds()) * 100
 
-		// Memory usage (bytes → KB)
+		// Память
 		memUsage := last.MemoryStats.Usage
 		memLimit := last.MemoryStats.Limit
 		memKB := memUsage / 1024
 		limitKB := memLimit / 1024
-
 		memPercent := 0.0
 		if memLimit > 0 {
 			memPercent = float64(memUsage) / float64(memLimit) * 100
 		}
 
 		summary := container.ContainerStatsSummary{
-			DurationStr: duration.String(),
+			DurationStr: dur.String(),
 			CPUUsageNs:  cpuNs,
 			CPUPercent:  cpuPercent,
 			MemUsageKB:  memKB,
 			MemLimitKB:  limitKB,
 			MemPercent:  memPercent,
 		}
-
 		b, _ := json.MarshalIndent(summary, "", "  ")
 		statsJSON = string(b)
 	}

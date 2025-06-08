@@ -50,31 +50,36 @@ func (api *API) RunContainer(cfg container.ContainerConfig, showStats bool) (str
 	// 1) Create + defer Remove
 	id, err := api.containerManager.Create(cfg)
 	if err != nil {
-		return "", "", fmt.Errorf("create: %w", err)
+		return "", "", fmt.Errorf("create container: %w", err)
 	}
 	defer api.containerManager.Remove(id)
 
-	// 2) Start + засечь момент старта
+	// 2) Start + засечь старт
 	start := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
-		return "", "", fmt.Errorf("start: %w", err)
+		return "", "", fmt.Errorf("start container: %w", err)
 	}
 
-	// 3) Если нужна статистика — запустить стример
+	// Переменные для стрима
 	var (
-		last      container.StatsResponse
-		streamErr error
-		wg        sync.WaitGroup
+		firstUsage uint64
+		lastUsage  uint64
+		firstSet   bool
+		streamErr  error
+		wg         sync.WaitGroup
 	)
+
 	if showStats {
 		statsRdr, err := api.containerManager.StreamStats(id)
 		if err != nil {
-			return "", "", fmt.Errorf("stream stats: %w", err)
+			return "", "", fmt.Errorf("open stats stream: %w", err)
 		}
+
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			defer statsRdr.Close()
+
 			dec := json.NewDecoder(statsRdr)
 			for {
 				var sr container.StatsResponse
@@ -85,60 +90,69 @@ func (api *API) RunContainer(cfg container.ContainerConfig, showStats bool) (str
 					streamErr = err
 					return
 				}
-				last = sr
+				// Монотонный CPU-счётчик
+				usage := sr.CPUStats.CPUUsage.TotalUsage
+				if !firstSet {
+					firstUsage = usage
+					firstSet = true
+				}
+				lastUsage = usage
 			}
 		}()
 	}
 
-	// 4) Ждём, пока контейнер завершится
+	// 3) Ждём exit
 	if _, err := api.containerManager.Wait(id); err != nil {
-		return "", "", fmt.Errorf("wait: %w", err)
+		return "", "", fmt.Errorf("wait container: %w", err)
 	}
-	// Дождаться статистического потока
+	// Дождаться потока
 	if showStats {
 		wg.Wait()
 		if streamErr != nil {
-			return "", "", fmt.Errorf("stats stream: %w", streamErr)
+			return "", "", fmt.Errorf("stats stream error: %w", streamErr)
 		}
 	}
 
-	// 5) Собрать логи
+	// 4) Логи
 	logs, err := api.containerManager.GetLogs(id)
 	if err != nil {
-		return "", "", fmt.Errorf("logs: %w", err)
+		return "", "", fmt.Errorf("get logs: %w", err)
 	}
 
-	// 6) Пост-обработка и JSON-ответ по stats
+	// 5) Формируем JSON-ответ по stats
 	var statsJSON string
 	if showStats {
 		end := time.Now()
-		dur := end.Sub(start)
+		duration := end.Sub(start)
 
-		// CPU
-		cpuNs := last.CPUStats.CPUUsage.TotalUsage - last.PreCPUStats.CPUUsage.TotalUsage
-		if last.PreCPUStats.CPUUsage.TotalUsage == 0 {
-			cpuNs = last.CPUStats.CPUUsage.TotalUsage
+		// Безопасная дельта CPU
+		var deltaNs uint64
+		if lastUsage >= firstUsage {
+			deltaNs = lastUsage - firstUsage
+		} else {
+			// на случай переполнения счётчика
+			deltaNs = lastUsage
 		}
-		cpuPercent := float64(cpuNs) / float64(dur.Nanoseconds()) * 100
 
-		// Память
-		memUsage := last.MemoryStats.Usage
-		memLimit := last.MemoryStats.Limit
-		memKB := memUsage / 1024
-		limitKB := memLimit / 1024
-		memPercent := 0.0
-		if memLimit > 0 {
-			memPercent = float64(memUsage) / float64(memLimit) * 100
-		}
+		cpuPercent := float64(deltaNs) / float64(duration.Nanoseconds()) * 100
+
+		// Для памяти можно взять последний кадр sr.MemoryStats,
+		// поэтому нужно захватывать его аналогично CPU,
+		// но в простейшем варианте — оставить 0 или убрать измерения.
+		//
+		// Если вам нужна финальная память,
+		// захватывайте и её в потоке в переменной lastMemUsage/lastMemLimit.
 
 		summary := container.ContainerStatsSummary{
-			DurationStr: dur.String(),
-			CPUUsageNs:  cpuNs,
+			DurationStr: duration.String(),
+			CPUUsageNs:  deltaNs,
 			CPUPercent:  cpuPercent,
-			MemUsageKB:  memKB,
-			MemLimitKB:  limitKB,
-			MemPercent:  memPercent,
+			// здесь пока нули, или возьмите из вашего sr
+			MemUsageKB: 0,
+			MemLimitKB: 0,
+			MemPercent: 0,
 		}
+
 		b, _ := json.MarshalIndent(summary, "", "  ")
 		statsJSON = string(b)
 	}

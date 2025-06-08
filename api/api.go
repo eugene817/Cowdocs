@@ -14,6 +14,11 @@ type API struct {
 	containerManager container.Manager
 }
 
+// Function to create a new API instance
+func NewAPI(mgr container.Manager) *API {
+	return &API{containerManager: mgr}
+}
+
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
     // 1) Создаём контейнер
     id, err := api.containerManager.Create(config)
@@ -71,6 +76,7 @@ func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (
 
     return logs, statsJSON, nil
 }
+
 // Function to run containers in parallel using goroutines and channels.
 // The container logs are sent to the channel.
 // Creates. Starts, Waits and Removes the container.

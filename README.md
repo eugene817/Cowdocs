@@ -7,6 +7,5 @@ go test -v ./tests
 
 ### TODOS:
 
-- [ ] Add flags to make ContainerRun work with long working containers and slow
-- [ ] Rewrite tests
-- [ ] Make refactoring and error checking pipelines
+- [x] Add flags to make ContainerRun work with long working containers and slow
+- [x] Make refactoring and error checking pipelines

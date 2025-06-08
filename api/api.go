@@ -3,9 +3,11 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/eugene817/Cowdocs/container"
 )
 
@@ -20,74 +22,106 @@ func NewAPI(mgr container.Manager) *API {
 }
 
 func (api *API) RunContainer(config container.ContainerConfig, showStats bool) (string, string, error) {
-	// 1) Create + defer remove
+	// 1) Create the container
 	id, err := api.containerManager.Create(config)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create container: %w", err)
 	}
+	// Ensure removal on exit
 	defer api.containerManager.Remove(id)
 
-	// 2) Start + record startTime
+	// 2) Start + record the start time
 	startTime := time.Now()
 	if err := api.containerManager.Start(id); err != nil {
 		return "", "", fmt.Errorf("failed to start container: %w", err)
 	}
 
-	var statsJSON string
+	var (
+		// We'll keep the last StatsJSON frame here
+		last      dockertypes.StatsJSON
+		streamErr error
+		wg        sync.WaitGroup
+	)
+
 	if showStats {
-		// 3a) initial snapshot
-		initial, err := api.containerManager.GetStatsOneShot(id, startTime)
+		// 3a) Open the streaming stats API (Follow=false so stream ends on container exit)
+		statsReader, err := api.containerManager.StreamStats(id)
 		if err != nil {
-			return "", "", fmt.Errorf("failed to get initial stats: %w", err)
+			return "", "", fmt.Errorf("failed to open stats stream: %w", err)
 		}
 
-		// 3b) wait for container exit
-		api.containerManager.Wait(id)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer statsReader.Close()
+			dec := json.NewDecoder(statsReader)
+			for {
+				var sr dockertypes.StatsJSON
+				if err := dec.Decode(&sr); err != nil {
+					if err == io.EOF {
+						// normal end of stream
+						return
+					}
+					streamErr = err
+					return
+				}
+				last = sr // save the last valid snapshot
+			}
+		}()
+	}
+
+	// 3b) Wait for the container to exit
+	if _, err := api.containerManager.Wait(id); err != nil {
+		return "", "", fmt.Errorf("failed to wait for container: %w", err)
+	}
+
+	// 3c) Wait for the stats‐stream goroutine to finish
+	if showStats {
+		wg.Wait()
+		if streamErr != nil {
+			return "", "", fmt.Errorf("error reading stats stream: %w", streamErr)
+		}
+	}
+
+	// 4) Collect logs
+	logs, err := api.containerManager.GetLogs(id)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get logs: %w", err)
+	}
+
+	// 5) Build JSON summary if requested
+	var statsJSON string
+	if showStats {
 		endTime := time.Now()
 		duration := endTime.Sub(startTime)
 
-		// 3c) final snapshot (before removal!)
-		final, err := api.containerManager.GetStatsOneShot(id, startTime)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to get final stats: %w", err)
+		// Cumulative CPU usage in nanoseconds
+		cpuNs := last.CPUStats.CPUUsage.TotalUsage
+		// Average CPU% over the run
+		cpuPercent := float64(cpuNs) / float64(duration.Nanoseconds()) * 100
+
+		// Memory usage (bytes → KB)
+		memUsage := last.MemoryStats.Usage
+		memLimit := last.MemoryStats.Limit
+		memKB := memUsage / 1024
+		limitKB := memLimit / 1024
+
+		memPercent := 0.0
+		if memLimit > 0 {
+			memPercent = float64(memUsage) / float64(memLimit) * 100
 		}
 
-		// 3d) вычисляем CPU-дельту (с защитой от underflow)
-		var cpuDeltaNs uint64
-		if final.CPUUsageNs >= initial.CPUUsageNs {
-			cpuDeltaNs = final.CPUUsageNs - initial.CPUUsageNs
-		} else {
-			// если вдруг final < initial (иногда Docker возвращает 0 после stop),
-			// считаем, что всё время было final
-			cpuDeltaNs = final.CPUUsageNs
-		}
-		cpuPercent := float64(cpuDeltaNs) / float64(duration.Nanoseconds()) * 100
-
-		// 3e) память — берём финальное значение
-		memUsageKB := final.MemUsageKB
-		memLimitKB := final.MemLimitKB
-		memPercent := final.MemPercent
-
-		// 3f) собираем итоговую структуру
 		summary := container.ContainerStatsSummary{
 			DurationStr: duration.String(),
-			CPUUsageNs:  cpuDeltaNs,
+			CPUUsageNs:  cpuNs,
 			CPUPercent:  cpuPercent,
-			MemUsageKB:  memUsageKB,
-			MemLimitKB:  memLimitKB,
+			MemUsageKB:  memKB,
+			MemLimitKB:  limitKB,
 			MemPercent:  memPercent,
 		}
 
 		b, _ := json.MarshalIndent(summary, "", "  ")
 		statsJSON = string(b)
-	} else {
-		api.containerManager.Wait(id)
-	}
-
-	// 4) лог
-	logs, err := api.containerManager.GetLogs(id)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to get logs: %w", err)
 	}
 
 	return logs, statsJSON, nil

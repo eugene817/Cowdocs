@@ -483,3 +483,12 @@ func (dm *DockerManager) GetStatsOneShot(containerID string, startTime time.Time
 		MemPercent:  memPercent,
 	}, nil
 }
+
+func (dm *DockerManager) StreamStats(containerID string) (io.ReadCloser, error) {
+	// Follow=false → the stream ends as soon as the container stops
+	stats, err := dm.cli.ContainerStats(context.Background(), containerID, false)
+	if err != nil {
+		return nil, err
+	}
+	return stats.Body, nil
+}

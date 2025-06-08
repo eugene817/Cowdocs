@@ -1,8 +1,10 @@
 package container
 
 import (
-	"github.com/docker/docker/api/types/container"
+	"io"
 	"time"
+
+	"github.com/docker/docker/api/types/container"
 )
 
 // Manager interface with methods to manage containers
@@ -17,5 +19,6 @@ type Manager interface {
 	GetStats(containerID string) (string, error)
 	EnsureImage(image string) error
 	GetStatsOneShot(containerID string, startTime time.Time) (ContainerStatsSummary, error)
+	StreamStats(id string) (io.ReadCloser, error)
 	Ping() error
 }
